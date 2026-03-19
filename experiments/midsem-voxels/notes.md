@@ -11,13 +11,14 @@ Explore Perlin noise-driven voxel fields with real-time parameter control, runni
 
 ## Architecture
 
-The script is a single-file tool with four main classes:
+The script is a single-file tool with five main classes:
 
 | Class | Role |
 |-------|------|
 | `PerlinNoise` | Deterministic 3D gradient noise with octave layering |
-| `VoxelConduit` | Rhino DisplayConduit subclass — draws preview meshes and bounds directly into the viewport without baking |
+| `VoxelConduit` | Rhino DisplayConduit subclass — draws preview meshes (with opacity), bounds, path trails, and start/end point markers directly into the viewport without baking |
 | `VoxelSystem` | Core engine — generates voxel fields and builds meshes for display |
+| `VoxelPathfinder` | Pathfinding engine — builds a traversal graph (voxel-centre adjacency or wireframe-edge adjacency) from the voxel field, runs scored greedy walks from user-assigned or auto-generated start points toward optional attractor geometry, with branching support |
 | `VoxelDialog` | Eto.Forms UI — all sliders, buttons, and colour pickers in collapsible `Expander` sections. Uses a debounced UITimer (0.12s) with two dirty flags to separate heavy recomputes from cheap display refreshes |
 
 ## Current Capabilities
@@ -57,8 +58,48 @@ The script is a single-file tool with four main classes:
 - Configurable custom scale factor
 - Feature edge detection for wireframe overlay on custom shapes
 
+### Pathfinding
+- Generates paths through the voxel volume from user-assigned or auto-generated start points
+- Two **graph modes** — **Voxel Centres** (cell-to-cell adjacency, 6-connected for cubes, 14-connected for BCC/TO) or **Voxel Edges** (wireframe vertex adjacency with shared-vertex merging)
+- **Start points** — pick interactively in the viewport, or auto-generate density-biased random starts from graph nodes
+- **Target attractors** — optional target points, curves, and meshes/breps/surfaces that pull paths toward them
+- Scored greedy walk at each step evaluates every neighbour by:
+  - **Density pull** — prefer high-density nodes
+  - **Attractor pull** — proximity and directional bias toward nearest target geometry
+  - **Momentum** — continue in the same direction (dot product of previous and candidate vectors)
+  - **Separation** — penalise nodes previously visited by any agent (global visit counter)
+  - **Wander** — random noise per candidate for organic variation
+- **Branching** — probabilistic splitting spawns a new agent down the next-best edge, capped by max branches
+- Paths are drawn live via the display conduit as coloured polylines; start points shown as round control points
+- Display controls: show/hide paths, show/hide points, path colour, point colour, path width, point size
+- **Bake Paths** commits all trail polylines as curves and start points to the Rhino document
+- Paths auto-clear when voxels are regenerated (graph becomes stale)
+
+#### Pathfinding Parameters
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Graph Mode | dropdown | Voxel Centres | Centre (cell-to-cell) or Edge (wireframe) traversal |
+| Agent Count | 1–50 | 5 | Number of random start points when auto-generating |
+| Max Steps | 10–500 | 100 | Maximum walk length per agent |
+| Branch Prob | 0.0–0.3 | 0.05 | Chance of spawning a branch per step |
+| Max Branches | 0–200 | 50 | Cap on total branches across all agents |
+| Density Pull | 0.0–2.0 | 1.0 | Attraction toward high-density voxel nodes |
+| Attractor Pull | 0.0–3.0 | 1.5 | Strength of pull toward assigned target geometry |
+| Attractor Radius | 1.0–200.0 | 50.0 | Max influence distance for target geometry |
+| Momentum | 0.0–2.0 | 0.8 | Preference for continuing in same direction |
+| Separation | 0.0–2.0 | 0.5 | Penalty for visiting already-walked nodes |
+| Wander | 0.0–2.0 | 0.3 | Random exploration factor |
+| Seed | 0–100 | 42 | Random seed for reproducibility |
+| Path Width | 1–10 | 2 | Display line thickness in pixels |
+| Point Size | 2–20 | 8 | Display size of start/end point markers |
+| Path Colour | picker | gold (255,200,50) | Colour of path polylines in viewport |
+| Point Colour | picker | red (255,80,80) | Colour of start point markers in viewport |
+
 ### Display
 - Live viewport preview via DisplayConduit (no baking required)
+- **Show Voxels** checkbox — hide voxel mesh while keeping paths visible
+- **Voxel Opacity** slider (0–255) — translucent voxels via `DisplayMaterial.Transparency`; at full opacity vertex colours use `DrawMeshFalseColors`, at reduced opacity falls back to `DrawMeshShaded` with transparent material
 - Density-mapped vertex colours (false colour mode) or flat shaded
 - Bounding box wireframe and voxel edge wireframe toggles
 - Colour pickers for voxels, edges, and bounds
@@ -67,6 +108,7 @@ The script is a single-file tool with four main classes:
 ### Baking (Output)
 - **Bake** — add voxel mesh to document with vertex colours
 - **Bake Brep** — convert each voxel to a NURBS polysurface (no colour)
+- **Bake Paths** — add path polylines as curves and start points to document
 
 ## Performance Notes
 - The debounced timer prevents recompute on every slider pixel — parameters are batched at 0.12s intervals
@@ -81,11 +123,15 @@ The script is a single-file tool with four main classes:
 - **Hollow shell mode** — removed to simplify the pipeline
 - **Voxel density rotation** — two-axis density-driven rotation removed
 - **Voxel density scale** — neighbour-aware density scaling removed
-- **Edge boids** — agent-based surface pathfinding removed
-- **Boid path attractor** — curve attractors for boid direction removed
+- **Edge boids** — replaced by `VoxelPathfinder` system with attractor-driven pathfinding
+- **Boid path attractor** — now integrated into pathfinder as target curves/geos
 - **Melt / blend** — Laplacian mesh blending removed
 
 ## Ideas to Explore
+- [ ] Path trail attractors — use generated paths as curve attractors for voxel density
+- [ ] Trail mesh generation — sweep a profile along paths for 3D mycelium tubes
+- [ ] Multi-agent species — different agent groups with competing rules/targets
+- [ ] Animated growth — step-by-step path growth with play/pause
 - [ ] Multi-material / multi-colour voxels based on density ranges
 - [ ] Export to STL or OBJ for 3D printing
 - [ ] Marching cubes for smooth isosurface extraction instead of boxes

@@ -8,6 +8,7 @@ import Rhino
 import Rhino.Geometry as rg
 import Rhino.Display as rd
 import scriptcontext as sc
+import rhinoscriptsyntax as rs
 import System
 import System.Drawing
 import math
@@ -90,8 +91,18 @@ class VoxelConduit(rd.DisplayConduit):
         self.edge_color = System.Drawing.Color.FromArgb(40, 40, 40)
         self.show_bounds = True
         self.show_edges = True
+        self.show_voxels = True
         self.use_vertex_colors = True
         self.shaded_material = rd.DisplayMaterial()
+        self.voxel_opacity = 255
+        self.path_trails = []
+        self.path_color = System.Drawing.Color.FromArgb(255, 200, 50)
+        self.path_thickness = 2
+        self.show_paths = True
+        self.path_points = []
+        self.path_point_color = System.Drawing.Color.FromArgb(255, 80, 80)
+        self.path_point_size = 8
+        self.show_path_points = True
 
     def CalculateBoundingBox(self, e):
         """Expand the viewport clipping box to include all displayed geometry."""
@@ -99,18 +110,31 @@ class VoxelConduit(rd.DisplayConduit):
             e.IncludeBoundingBox(self.bbox)
 
     def PostDrawObjects(self, e):
-        """Draw geometry each frame. Voxel mesh rendered as false-colour or shaded."""
-        if self.mesh and self.mesh.Vertices.Count > 0:
-            if self.use_vertex_colors:
-                e.Display.DrawMeshFalseColors(self.mesh)
+        """Draw voxel mesh (with opacity), edges, bounds, paths, and points."""
+        if self.show_voxels and self.mesh and self.mesh.Vertices.Count > 0:
+            if self.voxel_opacity >= 255:
+                if self.use_vertex_colors:
+                    e.Display.DrawMeshFalseColors(self.mesh)
+                else:
+                    e.Display.DrawMeshShaded(self.mesh, self.shaded_material)
             else:
-                e.Display.DrawMeshShaded(self.mesh, self.shaded_material)
+                mat = rd.DisplayMaterial(self.shaded_material)
+                mat.Transparency = 1.0 - self.voxel_opacity / 255.0
+                e.Display.DrawMeshShaded(self.mesh, mat)
             if self.show_edges:
                 wire = self.edge_mesh if self.edge_mesh else self.mesh
                 e.Display.DrawMeshWires(wire, self.edge_color)
         if self.show_bounds and self.bound_lines:
             for ln in self.bound_lines:
                 e.Display.DrawLine(ln, self.bound_color, 1)
+        if self.show_paths and self.path_trails:
+            for trail in self.path_trails:
+                if len(trail) > 1:
+                    e.Display.DrawPolyline(trail, self.path_color, self.path_thickness)
+        if self.show_path_points and self.path_points:
+            for pt in self.path_points:
+                e.Display.DrawPoint(pt, rd.PointStyle.RoundControlPoint,
+                                    self.path_point_size, self.path_point_color)
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +693,364 @@ class VoxelSystem(object):
 
 
 # ---------------------------------------------------------------------------
+# Voxel Pathfinder
+# Builds a traversal graph from the voxel field (either voxel-centre
+# adjacency or wireframe-edge adjacency) and runs scored greedy walks
+# from user-assigned or auto-generated start points, optionally pulled
+# toward attractor geometry. Supports branching for tree-like networks.
+# ---------------------------------------------------------------------------
+_CUBE_EDGES = (
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    (4, 5), (5, 6), (6, 7), (7, 4),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+)
+
+_CENTRE_6 = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
+_CENTRE_14 = _CENTRE_6 + (
+    (1,1,1),(1,1,-1),(1,-1,1),(1,-1,-1),
+    (-1,1,1),(-1,1,-1),(-1,-1,1),(-1,-1,-1))
+
+
+def _closest_dist_static(pt, geo):
+    """Shortest distance from pt to Curve/Mesh/Brep/Surface."""
+    try:
+        if isinstance(geo, rg.Curve):
+            rc, t = geo.ClosestPoint(pt)
+            if rc:
+                return pt.DistanceTo(geo.PointAt(t))
+        elif isinstance(geo, rg.Mesh):
+            cp = geo.ClosestPoint(pt)
+            return pt.DistanceTo(cp)
+        elif isinstance(geo, rg.Brep):
+            cp = geo.ClosestPoint(pt)
+            return pt.DistanceTo(cp)
+        elif isinstance(geo, rg.Surface):
+            rc, u, v = geo.ClosestPoint(pt)
+            if rc:
+                return pt.DistanceTo(geo.PointAt(u, v))
+    except:
+        pass
+    return float('inf')
+
+
+class VoxelPathfinder(object):
+    def __init__(self):
+        self.graph = {}
+        self.node_positions = {}
+        self.node_density = {}
+        self.trails = []
+        self.start_points = []
+        self.target_points = []
+        self.target_curves = []
+        self.target_geos = []
+
+    @staticmethod
+    def _node_key(x, y, z):
+        """Quantise coordinates to 0.01 precision for vertex merging."""
+        return (int(round(x * 100)), int(round(y * 100)), int(round(z * 100)))
+
+    def _snap_to_nearest(self, pt):
+        """Return the graph node key closest to the given world point."""
+        best_k = None
+        best_d = float('inf')
+        for k, p in self.node_positions.items():
+            d = pt.DistanceTo(p)
+            if d < best_d:
+                best_d = d
+                best_k = k
+        return best_k
+
+    # -- Centre graph (cell-to-cell) ----------------------------------------
+    def build_centre_graph(self, voxels, cell_w, cell_l, cell_h,
+                           grid_origin, grid_type):
+        """Build adjacency graph where nodes are voxel centres and edges
+        connect face-adjacent (cubes: 6-connected) or face+body-adjacent
+        (BCC/TO: 14-connected) occupied voxels."""
+        self.graph = {}
+        self.node_positions = {}
+        self.node_density = {}
+        ox = grid_origin.X; oy = grid_origin.Y; oz = grid_origin.Z
+        hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
+
+        voxel_set = {}
+        for (fx, fy, fz, val) in voxels:
+            voxel_set[(fx, fy, fz)] = val
+
+        offsets = _CENTRE_14 if grid_type == 1 else _CENTRE_6
+        bcc_offsets = ((0.5, 0.5, 0.5), (-0.5, -0.5, -0.5),
+                       (0.5, 0.5, -0.5), (0.5, -0.5, 0.5),
+                       (-0.5, 0.5, 0.5), (0.5, -0.5, -0.5),
+                       (-0.5, 0.5, -0.5), (-0.5, -0.5, 0.5))
+
+        graph = self.graph
+        positions = self.node_positions
+        density = self.node_density
+
+        for (fx, fy, fz, val) in voxels:
+            k = (fx, fy, fz)
+            cx = ox + fx * cell_w + hw
+            cy = oy + fy * cell_l + hl
+            cz = oz + fz * cell_h + hh
+            if k not in graph:
+                graph[k] = set()
+                positions[k] = rg.Point3d(cx, cy, cz)
+                density[k] = val
+
+            for (dx, dy, dz) in offsets:
+                nk = (fx + dx, fy + dy, fz + dz)
+                if nk in voxel_set:
+                    nval = voxel_set[nk]
+                    if nk not in graph:
+                        ncx = ox + nk[0] * cell_w + hw
+                        ncy = oy + nk[1] * cell_l + hl
+                        ncz = oz + nk[2] * cell_h + hh
+                        graph[nk] = set()
+                        positions[nk] = rg.Point3d(ncx, ncy, ncz)
+                        density[nk] = nval
+                    graph[k].add(nk)
+                    graph[nk].add(k)
+
+            if grid_type == 1:
+                for (dx, dy, dz) in bcc_offsets:
+                    nk = (fx + dx, fy + dy, fz + dz)
+                    if nk in voxel_set:
+                        nval = voxel_set[nk]
+                        if nk not in graph:
+                            ncx = ox + nk[0] * cell_w + hw
+                            ncy = oy + nk[1] * cell_l + hl
+                            ncz = oz + nk[2] * cell_h + hh
+                            graph[nk] = set()
+                            positions[nk] = rg.Point3d(ncx, ncy, ncz)
+                            density[nk] = nval
+                        graph[k].add(nk)
+                        graph[nk].add(k)
+
+    # -- Edge graph (wireframe) ---------------------------------------------
+    def build_edge_graph(self, voxels, cell_w, cell_l, cell_h,
+                         grid_origin, grid_type):
+        """Build adjacency graph from all voxel edge segments.
+        Shared vertices between adjacent voxels are merged via _node_key."""
+        self.graph = {}
+        self.node_positions = {}
+        self.node_density = {}
+        ox = grid_origin.X; oy = grid_origin.Y; oz = grid_origin.Z
+        hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
+        _nk = self._node_key
+
+        if grid_type == 1:
+            sw = cell_w * 0.25; sl = cell_l * 0.25; sh = cell_h * 0.25
+            scaled_verts = tuple(
+                (vx * sw, vy * sl, vz * sh)
+                for (vx, vy, vz) in VoxelSystem._TO_VERTS)
+            edges = VoxelSystem._TO_EDGES
+        else:
+            scaled_verts = (
+                (-hw, -hl, -hh), ( hw, -hl, -hh),
+                ( hw,  hl, -hh), (-hw,  hl, -hh),
+                (-hw, -hl,  hh), ( hw, -hl,  hh),
+                ( hw,  hl,  hh), (-hw,  hl,  hh))
+            edges = _CUBE_EDGES
+
+        graph = self.graph
+        positions = self.node_positions
+        density = self.node_density
+
+        for (fx, fy, fz, val) in voxels:
+            cx = ox + fx * cell_w + hw
+            cy = oy + fy * cell_l + hl
+            cz = oz + fz * cell_h + hh
+            for (ei, ej) in edges:
+                dx0, dy0, dz0 = scaled_verts[ei]
+                dx1, dy1, dz1 = scaled_verts[ej]
+                x0 = cx + dx0; y0 = cy + dy0; z0 = cz + dz0
+                x1 = cx + dx1; y1 = cy + dy1; z1 = cz + dz1
+                k0 = _nk(x0, y0, z0)
+                k1 = _nk(x1, y1, z1)
+                if k0 not in graph:
+                    graph[k0] = set()
+                    positions[k0] = rg.Point3d(x0, y0, z0)
+                if k1 not in graph:
+                    graph[k1] = set()
+                    positions[k1] = rg.Point3d(x1, y1, z1)
+                graph[k0].add(k1)
+                graph[k1].add(k0)
+                if k0 not in density or val > density[k0]:
+                    density[k0] = val
+                if k1 not in density or val > density[k1]:
+                    density[k1] = val
+
+    # -- Random start generation --------------------------------------------
+    def generate_random_starts(self, count, seed):
+        """Pick random graph nodes biased toward high density."""
+        random.seed(seed)
+        if not self.graph:
+            self.start_points = []
+            return
+        nodes = list(self.graph.keys())
+        sorted_nodes = sorted(
+            nodes, key=lambda k: self.node_density.get(k, 0), reverse=True)
+        pool = sorted_nodes[:max(1, len(sorted_nodes) // 3)]
+        self.start_points = []
+        for _ in range(min(count, len(pool))):
+            k = pool[random.randint(0, len(pool) - 1)]
+            self.start_points.append(self.node_positions[k])
+
+    # -- Attractor distance helper ------------------------------------------
+    def _attractor_score(self, nb_pos, curr_pos, attr_strength, attr_radius):
+        """Compute attractor pull score for a candidate neighbour."""
+        if attr_strength <= 0:
+            return 0.0
+        score = 0.0
+
+        if self.target_points:
+            best_d = float('inf')
+            best_pt = None
+            for tp in self.target_points:
+                d = nb_pos.DistanceTo(tp)
+                if d < best_d:
+                    best_d = d
+                    best_pt = tp
+            if best_d < attr_radius:
+                score += attr_strength * (1.0 - best_d / attr_radius)
+            if best_pt is not None:
+                dx_t = best_pt.X - curr_pos.X
+                dy_t = best_pt.Y - curr_pos.Y
+                dz_t = best_pt.Z - curr_pos.Z
+                dx_n = nb_pos.X - curr_pos.X
+                dy_n = nb_pos.Y - curr_pos.Y
+                dz_n = nb_pos.Z - curr_pos.Z
+                ln_t = math.sqrt(dx_t*dx_t + dy_t*dy_t + dz_t*dz_t)
+                ln_n = math.sqrt(dx_n*dx_n + dy_n*dy_n + dz_n*dz_n)
+                if ln_t > 1e-9 and ln_n > 1e-9:
+                    dot = (dx_t*dx_n + dy_t*dy_n + dz_t*dz_n) / (ln_t * ln_n)
+                    score += dot * attr_strength * 0.5
+
+        all_geos = list(self.target_curves) + list(self.target_geos)
+        if all_geos:
+            best_d = float('inf')
+            for geo in all_geos:
+                d = _closest_dist_static(nb_pos, geo)
+                if d < best_d:
+                    best_d = d
+            if best_d < attr_radius:
+                score += attr_strength * (1.0 - best_d / attr_radius)
+
+        return score
+
+    # -- Pathfinding --------------------------------------------------------
+    def find_paths(self, max_steps, branch_prob, max_branches,
+                   density_strength, attractor_strength, attractor_radius,
+                   momentum_strength, separation_strength,
+                   wander_strength, seed):
+        """Run scored greedy walks from each start point through the graph.
+
+        At every step each agent scores its neighbours by:
+          density pull    -- prefer high-density nodes
+          attractor pull  -- pull toward assigned target pts/curves/geos
+          momentum        -- prefer continuing in the same direction
+          separation      -- penalise previously visited nodes
+          wander          -- random noise for organic variation
+
+        Returns list of trails (each trail is a list of Point3d).
+        """
+        random.seed(seed)
+        self.trails = []
+        if not self.graph or not self.start_points:
+            return []
+
+        positions = self.node_positions
+        density = self.node_density
+        graph = self.graph
+
+        visit_counts = {}
+        total_branches = 0
+
+        agents = []
+        for sp in self.start_points:
+            sk = self._snap_to_nearest(sp)
+            if sk is None:
+                continue
+            agents.append({
+                'pos': sk,
+                'trail': [sk],
+                'prev': None,
+                'alive': True
+            })
+
+        for step in range(max_steps):
+            new_agents = []
+            any_alive = False
+            for agent in agents:
+                if not agent['alive']:
+                    continue
+                any_alive = True
+                current = agent['pos']
+                neighbors = list(graph.get(current, set()))
+                if not neighbors:
+                    agent['alive'] = False
+                    continue
+
+                curr_pos = positions[current]
+                scores = []
+                for nb in neighbors:
+                    score = density.get(nb, 0) * density_strength
+                    nb_pos = positions[nb]
+
+                    score += self._attractor_score(
+                        nb_pos, curr_pos, attractor_strength, attractor_radius)
+
+                    if agent['prev'] is not None and momentum_strength > 0:
+                        prev_pos = positions[agent['prev']]
+                        dx0 = curr_pos.X - prev_pos.X
+                        dy0 = curr_pos.Y - prev_pos.Y
+                        dz0 = curr_pos.Z - prev_pos.Z
+                        dx1 = nb_pos.X - curr_pos.X
+                        dy1 = nb_pos.Y - curr_pos.Y
+                        dz1 = nb_pos.Z - curr_pos.Z
+                        dot = dx0 * dx1 + dy0 * dy1 + dz0 * dz1
+                        score += dot * momentum_strength
+
+                    vc = visit_counts.get(nb, 0)
+                    if vc > 0:
+                        score -= vc * separation_strength
+
+                    score += random.random() * wander_strength
+                    scores.append((score, nb))
+
+                scores.sort(key=lambda x: x[0], reverse=True)
+                chosen = scores[0][1]
+
+                agent['prev'] = current
+                agent['pos'] = chosen
+                agent['trail'].append(chosen)
+                visit_counts[chosen] = visit_counts.get(chosen, 0) + 1
+
+                if (branch_prob > 0 and total_branches < max_branches
+                        and len(scores) > 1
+                        and random.random() < branch_prob):
+                    branch_target = scores[1][1]
+                    new_agents.append({
+                        'pos': branch_target,
+                        'trail': [current, branch_target],
+                        'prev': current,
+                        'alive': True
+                    })
+                    total_branches += 1
+
+            agents.extend(new_agents)
+            if not any_alive:
+                break
+
+        self.trails = []
+        for agent in agents:
+            if len(agent['trail']) > 1:
+                pts = [positions[k] for k in agent['trail']]
+                self.trails.append(pts)
+
+        return self.trails
+
+
+# ---------------------------------------------------------------------------
 # UI Dialog
 # Eto.Forms window with all sliders, checkboxes and buttons. Uses a debounced
 # timer (UITimer at 0.12s) so slider drags don't trigger a full recompute on
@@ -696,6 +1078,7 @@ class VoxelDialog(forms.Form):
             System.Drawing.Color.FromArgb(100, 180, 255))
         self.edge_color = System.Drawing.Color.FromArgb(40, 40, 40)
         self.bounds_color = System.Drawing.Color.FromArgb(80, 80, 80)
+        self.pathfinder = VoxelPathfinder()
 
         self._compute_dirty = False
         self._display_dirty = False
@@ -1003,6 +1386,158 @@ class VoxelDialog(forms.Form):
         exp.Content = inner
         layout.AddRow(exp)
 
+        # -- pathfinding -------------------------------------------------------
+        exp = forms.Expander()
+        exp.Header = self._bold("Pathfinding")
+        exp.Expanded = False
+        inner = forms.DynamicLayout()
+        inner.DefaultSpacing = drawing.Size(4, 4)
+
+        lbl_gm = forms.Label()
+        lbl_gm.Text = "Graph Mode"
+        lbl_gm.Width = 105
+        self.dd_graph_mode = forms.DropDown()
+        self.dd_graph_mode.Items.Add("Voxel Centres")
+        self.dd_graph_mode.Items.Add("Voxel Edges")
+        self.dd_graph_mode.SelectedIndex = 0
+        inner.AddRow(lbl_gm, self.dd_graph_mode)
+
+        lbl_sp = forms.Label()
+        lbl_sp.Text = "-- Start Points --"
+        inner.AddRow(lbl_sp)
+
+        self.sld_pf_agents, self.txt_pf_agents = self._int_slider(
+            inner, "Agent Count", 1, 50, 5, self._noop)
+
+        btn_pick_starts = forms.Button()
+        btn_pick_starts.Text = "Assign Start Pts"
+        btn_pick_starts.Click += self._on_pick_start_pts
+        btn_clr_starts = forms.Button()
+        btn_clr_starts.Text = "Clear"
+        btn_clr_starts.Click += self._on_clear_start_pts
+        btn_rand_starts = forms.Button()
+        btn_rand_starts.Text = "Generate Random"
+        btn_rand_starts.Click += self._on_generate_random_starts
+        inner.AddRow(btn_pick_starts, btn_clr_starts, btn_rand_starts)
+
+        self.lbl_start_count = forms.Label()
+        self.lbl_start_count.Text = "Start Pts: 0"
+        inner.AddRow(self.lbl_start_count)
+
+        lbl_tgt = forms.Label()
+        lbl_tgt.Text = "-- Targets --"
+        inner.AddRow(lbl_tgt)
+
+        btn_pick_tgt_pts = forms.Button()
+        btn_pick_tgt_pts.Text = "Assign Target Pts"
+        btn_pick_tgt_pts.Click += self._on_pick_target_pts
+        btn_clr_tgt_pts = forms.Button()
+        btn_clr_tgt_pts.Text = "Clear"
+        btn_clr_tgt_pts.Click += self._on_clear_target_pts
+        inner.AddRow(btn_pick_tgt_pts, btn_clr_tgt_pts)
+
+        self.lbl_tgt_pt_count = forms.Label()
+        self.lbl_tgt_pt_count.Text = "Target Pts: 0"
+        inner.AddRow(self.lbl_tgt_pt_count)
+
+        btn_pick_tgt_crv = forms.Button()
+        btn_pick_tgt_crv.Text = "Assign Target Curves"
+        btn_pick_tgt_crv.Click += self._on_pick_target_curves
+        btn_clr_tgt_crv = forms.Button()
+        btn_clr_tgt_crv.Text = "Clear"
+        btn_clr_tgt_crv.Click += self._on_clear_target_curves
+        inner.AddRow(btn_pick_tgt_crv, btn_clr_tgt_crv)
+
+        self.lbl_tgt_crv_count = forms.Label()
+        self.lbl_tgt_crv_count.Text = "Target Curves: 0"
+        inner.AddRow(self.lbl_tgt_crv_count)
+
+        btn_pick_tgt_geo = forms.Button()
+        btn_pick_tgt_geo.Text = "Assign Target Geos"
+        btn_pick_tgt_geo.Click += self._on_pick_target_geos
+        btn_clr_tgt_geo = forms.Button()
+        btn_clr_tgt_geo.Text = "Clear"
+        btn_clr_tgt_geo.Click += self._on_clear_target_geos
+        inner.AddRow(btn_pick_tgt_geo, btn_clr_tgt_geo)
+
+        self.lbl_tgt_geo_count = forms.Label()
+        self.lbl_tgt_geo_count.Text = "Target Geos: 0"
+        inner.AddRow(self.lbl_tgt_geo_count)
+
+        lbl_alg = forms.Label()
+        lbl_alg.Text = "-- Algorithm --"
+        inner.AddRow(lbl_alg)
+
+        self.sld_pf_steps, self.txt_pf_steps = self._int_slider(
+            inner, "Max Steps", 10, 500, 100, self._noop)
+        self.sld_pf_branch, self.txt_pf_branch = self._float_slider(
+            inner, "Branch Prob", 0.0, 0.3, 0.05, self._noop)
+        self.sld_pf_max_br, self.txt_pf_max_br = self._int_slider(
+            inner, "Max Branches", 0, 200, 50, self._noop)
+        self.sld_pf_density, self.txt_pf_density = self._float_slider(
+            inner, "Density Pull", 0.0, 2.0, 1.0, self._noop)
+        self.sld_pf_attr, self.txt_pf_attr = self._float_slider(
+            inner, "Attractor Pull", 0.0, 3.0, 1.5, self._noop)
+        self.sld_pf_attr_r, self.txt_pf_attr_r = self._float_slider(
+            inner, "Attr Radius", 1.0, 200.0, 50.0, self._noop)
+        self.sld_pf_momentum, self.txt_pf_momentum = self._float_slider(
+            inner, "Momentum", 0.0, 2.0, 0.8, self._noop)
+        self.sld_pf_sep, self.txt_pf_sep = self._float_slider(
+            inner, "Separation", 0.0, 2.0, 0.5, self._noop)
+        self.sld_pf_wander, self.txt_pf_wander = self._float_slider(
+            inner, "Wander", 0.0, 2.0, 0.3, self._noop)
+        self.sld_pf_seed, self.txt_pf_seed = self._int_slider(
+            inner, "Seed", 0, 100, 42, self._noop)
+
+        btn_gen_paths = forms.Button()
+        btn_gen_paths.Text = "Generate Paths"
+        btn_gen_paths.Click += self._on_generate_paths
+        btn_clr_paths = forms.Button()
+        btn_clr_paths.Text = "Clear Paths"
+        btn_clr_paths.Click += self._on_clear_paths
+        btn_bake_paths = forms.Button()
+        btn_bake_paths.Text = "Bake Paths"
+        btn_bake_paths.Click += self._on_bake_paths
+        inner.AddRow(btn_gen_paths, btn_clr_paths, btn_bake_paths)
+
+        self.lbl_path_status = forms.Label()
+        self.lbl_path_status.Text = "Paths: 0"
+        inner.AddRow(self.lbl_path_status)
+
+        lbl_pd = forms.Label()
+        lbl_pd.Text = "-- Display --"
+        inner.AddRow(lbl_pd)
+
+        self.chk_show_paths = forms.CheckBox()
+        self.chk_show_paths.Text = "Show Paths"
+        self.chk_show_paths.Checked = True
+        self.chk_show_paths.CheckedChanged += lambda s, e: self._update_path_display()
+
+        self.chk_show_path_pts = forms.CheckBox()
+        self.chk_show_path_pts.Text = "Show Points"
+        self.chk_show_path_pts.Checked = True
+        self.chk_show_path_pts.CheckedChanged += lambda s, e: self._update_path_display()
+        inner.AddRow(self.chk_show_paths, self.chk_show_path_pts)
+
+        self.sld_path_width, self.txt_path_width = self._int_slider(
+            inner, "Path Width", 1, 10, 2, self._update_path_display)
+        self.sld_pt_size, self.txt_pt_size = self._int_slider(
+            inner, "Point Size", 2, 20, 8, self._update_path_display)
+
+        self.btn_path_col = forms.Button()
+        self.btn_path_col.Text = "Path Colour"
+        self.btn_path_col.BackgroundColor = drawing.Color.FromArgb(255, 200, 50)
+        self.btn_path_col.Click += self._on_pick_path_color
+
+        self.btn_pt_col = forms.Button()
+        self.btn_pt_col.Text = "Point Colour"
+        self.btn_pt_col.BackgroundColor = drawing.Color.FromArgb(255, 80, 80)
+        self.btn_pt_col.Click += self._on_pick_point_color
+        inner.AddRow(self.btn_path_col, self.btn_pt_col)
+
+        exp.Content = inner
+        layout.AddRow(exp)
+
         # -- display -------------------------------------------------------
         exp = forms.Expander()
         exp.Header = self._bold("Display")
@@ -1010,22 +1545,30 @@ class VoxelDialog(forms.Form):
         inner = forms.DynamicLayout()
         inner.DefaultSpacing = drawing.Size(4, 4)
 
+        self.chk_show_voxels = forms.CheckBox()
+        self.chk_show_voxels.Text = "Show Voxels"
+        self.chk_show_voxels.Checked = True
+        self.chk_show_voxels.CheckedChanged += lambda s, e: self._update_voxel_visibility()
+
         self.chk_bounds = forms.CheckBox()
         self.chk_bounds.Text = "Show Bounding Box"
         self.chk_bounds.Checked = True
         self.chk_bounds.CheckedChanged += lambda s, e: self._mark_display()
+        inner.AddRow(self.chk_show_voxels, self.chk_bounds)
 
         self.chk_edges = forms.CheckBox()
         self.chk_edges.Text = "Show Voxel Edges"
         self.chk_edges.Checked = True
         self.chk_edges.CheckedChanged += lambda s, e: self._mark_display()
-        inner.AddRow(self.chk_bounds, self.chk_edges)
 
         self.chk_vcol = forms.CheckBox()
         self.chk_vcol.Text = "Vertex Colours"
         self.chk_vcol.Checked = True
         self.chk_vcol.CheckedChanged += lambda s, e: self._toggle_vertex_colors()
-        inner.AddRow(self.chk_vcol)
+        inner.AddRow(self.chk_edges, self.chk_vcol)
+
+        self.sld_opacity, self.txt_opacity = self._int_slider(
+            inner, "Voxel Opacity", 0, 255, 255, self._update_opacity)
 
         self.btn_vcol = forms.Button()
         self.btn_vcol.Text = "Voxel Colour"
@@ -1310,6 +1853,12 @@ class VoxelDialog(forms.Form):
 
         origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
         total = gx * gy * gz
+        self.pathfinder.trails = []
+        self.pathfinder.graph = {}
+        self.system.conduit.path_trails = []
+        self.system.conduit.path_points = []
+        if hasattr(self, 'lbl_path_status'):
+            self.lbl_path_status.Text = "Paths: 0"
         self.lbl_status.Text = "Computing {} cells...".format(total)
 
         voxels = self.system.generate(
@@ -1431,9 +1980,14 @@ class VoxelDialog(forms.Form):
         self.system.conduit.mesh = None
         self.system.conduit.edge_mesh = None
         self.system.conduit.bound_lines = []
+        self.system.conduit.path_trails = []
+        self.system.conduit.path_points = []
         self.system.voxels = []
+        self.pathfinder.trails = []
+        self.pathfinder.graph = {}
         sc.doc.Views.Redraw()
         self.lbl_status.Text = "Cleared"
+        self.lbl_path_status.Text = "Paths: 0"
 
     def _on_closed(self, sender, e):
         """Clean up when the dialog window is closed."""
@@ -1724,6 +2278,229 @@ class VoxelDialog(forms.Form):
             b = max(30, min(255, int(cb * val)))
             col = drawing.Color.FromArgb(r, gv, b)
             g.FillRectangle(col, float(i) * step_w, 0.0, step_w + 0.5, float(h))
+
+    # -- pathfinding helpers ------------------------------------------------
+    def _noop(self):
+        """No-op callback for algorithm sliders (manual generate only)."""
+        pass
+
+    # -- opacity & voxel visibility ----------------------------------------
+    def _update_opacity(self):
+        """Push voxel opacity to conduit."""
+        val = self._ival(self.txt_opacity, self.sld_opacity)
+        self.system.conduit.voxel_opacity = val
+        sc.doc.Views.Redraw()
+
+    def _update_voxel_visibility(self):
+        """Toggle voxel mesh visibility."""
+        self.system.conduit.show_voxels = self.chk_show_voxels.Checked == True
+        sc.doc.Views.Redraw()
+
+    # -- path display ------------------------------------------------------
+    def _update_path_display(self):
+        """Push current path display settings to conduit and redraw."""
+        self.system.conduit.show_paths = self.chk_show_paths.Checked == True
+        self.system.conduit.show_path_points = self.chk_show_path_pts.Checked == True
+        self.system.conduit.path_thickness = self._ival(
+            self.txt_path_width, self.sld_path_width)
+        self.system.conduit.path_point_size = self._ival(
+            self.txt_pt_size, self.sld_pt_size)
+        sc.doc.Views.Redraw()
+
+    # -- start point handlers ----------------------------------------------
+    def _on_pick_start_pts(self, sender, e):
+        """Let user pick points in the viewport as path start locations."""
+        pts = rs.GetPoints(True, message1="Pick start points (Enter to finish)")
+        if pts:
+            self.pathfinder.start_points = [rg.Point3d(p.X, p.Y, p.Z) for p in pts]
+            self.lbl_start_count.Text = "Start Pts: {}".format(len(self.pathfinder.start_points))
+            self.system.conduit.path_points = list(self.pathfinder.start_points)
+            sc.doc.Views.Redraw()
+
+    def _on_clear_start_pts(self, sender, e):
+        self.pathfinder.start_points = []
+        self.lbl_start_count.Text = "Start Pts: 0"
+        self.system.conduit.path_points = []
+        sc.doc.Views.Redraw()
+
+    def _on_generate_random_starts(self, sender, e):
+        """Auto-generate start points from graph nodes."""
+        voxels = self.system.voxels
+        if not voxels:
+            self.lbl_start_count.Text = "No voxels"
+            return
+        if not self.pathfinder.graph:
+            p = self._read_params()
+            gx, gy, gz = p[0], p[1], p[2]
+            cw, cl, ch = p[3], p[4], p[5]
+            grid_type = p[20]
+            origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
+            mode = self.dd_graph_mode.SelectedIndex
+            if mode == 0:
+                self.pathfinder.build_centre_graph(
+                    voxels, cw, cl, ch, origin, grid_type)
+            else:
+                self.pathfinder.build_edge_graph(
+                    voxels, cw, cl, ch, origin, grid_type)
+        count = self._ival(self.txt_pf_agents, self.sld_pf_agents)
+        seed = self._ival(self.txt_pf_seed, self.sld_pf_seed)
+        self.pathfinder.generate_random_starts(count, seed)
+        self.lbl_start_count.Text = "Start Pts: {}".format(len(self.pathfinder.start_points))
+        self.system.conduit.path_points = list(self.pathfinder.start_points)
+        sc.doc.Views.Redraw()
+
+    # -- target pickers ----------------------------------------------------
+    def _on_pick_target_pts(self, sender, e):
+        pts = rs.GetPoints(True, message1="Pick target points (Enter to finish)")
+        if pts:
+            self.pathfinder.target_points = [rg.Point3d(p.X, p.Y, p.Z) for p in pts]
+            self.lbl_tgt_pt_count.Text = "Target Pts: {}".format(
+                len(self.pathfinder.target_points))
+
+    def _on_clear_target_pts(self, sender, e):
+        self.pathfinder.target_points = []
+        self.lbl_tgt_pt_count.Text = "Target Pts: 0"
+
+    def _on_pick_target_curves(self, sender, e):
+        ids = rs.GetObjects("Select target curves", rs.filter.curve)
+        if ids:
+            self.pathfinder.target_curves = [
+                rs.coercecurve(cid) for cid in ids if rs.coercecurve(cid)]
+            self.lbl_tgt_crv_count.Text = "Target Curves: {}".format(
+                len(self.pathfinder.target_curves))
+
+    def _on_clear_target_curves(self, sender, e):
+        self.pathfinder.target_curves = []
+        self.lbl_tgt_crv_count.Text = "Target Curves: 0"
+
+    def _on_pick_target_geos(self, sender, e):
+        ids = rs.GetObjects("Select target meshes/breps/surfaces",
+                            rs.filter.mesh | rs.filter.polysurface | rs.filter.surface)
+        if ids:
+            geos = []
+            for gid in ids:
+                g = rs.coercemesh(gid) or rs.coercebrep(gid) or rs.coercesurface(gid)
+                if g:
+                    geos.append(g)
+            self.pathfinder.target_geos = geos
+            self.lbl_tgt_geo_count.Text = "Target Geos: {}".format(
+                len(self.pathfinder.target_geos))
+
+    def _on_clear_target_geos(self, sender, e):
+        self.pathfinder.target_geos = []
+        self.lbl_tgt_geo_count.Text = "Target Geos: 0"
+
+    # -- generate / clear / bake paths -------------------------------------
+    def _on_generate_paths(self, sender, e):
+        """Build graph from current voxels and run pathfinding."""
+        voxels = self.system.voxels
+        if not voxels:
+            self.lbl_path_status.Text = "No voxels -- generate first"
+            return
+
+        p = self._read_params()
+        gx, gy, gz = p[0], p[1], p[2]
+        cw, cl, ch = p[3], p[4], p[5]
+        grid_type = p[20]
+        origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
+
+        mode = self.dd_graph_mode.SelectedIndex
+        self.lbl_path_status.Text = "Building {} graph...".format(
+            "centre" if mode == 0 else "edge")
+        if mode == 0:
+            self.pathfinder.build_centre_graph(
+                voxels, cw, cl, ch, origin, grid_type)
+        else:
+            self.pathfinder.build_edge_graph(
+                voxels, cw, cl, ch, origin, grid_type)
+
+        if not self.pathfinder.start_points:
+            count = self._ival(self.txt_pf_agents, self.sld_pf_agents)
+            seed = self._ival(self.txt_pf_seed, self.sld_pf_seed)
+            self.pathfinder.generate_random_starts(count, seed)
+            self.lbl_start_count.Text = "Start Pts: {} (auto)".format(
+                len(self.pathfinder.start_points))
+
+        max_steps = self._ival(self.txt_pf_steps, self.sld_pf_steps)
+        branch_prob = self._fval(
+            self.txt_pf_branch, self.sld_pf_branch, 0.0, 0.3)
+        max_branches = self._ival(self.txt_pf_max_br, self.sld_pf_max_br)
+        density_str = self._fval(
+            self.txt_pf_density, self.sld_pf_density, 0.0, 2.0)
+        attr_str = self._fval(
+            self.txt_pf_attr, self.sld_pf_attr, 0.0, 3.0)
+        attr_r = self._fval(
+            self.txt_pf_attr_r, self.sld_pf_attr_r, 1.0, 200.0)
+        momentum = self._fval(
+            self.txt_pf_momentum, self.sld_pf_momentum, 0.0, 2.0)
+        separation = self._fval(
+            self.txt_pf_sep, self.sld_pf_sep, 0.0, 2.0)
+        wander = self._fval(
+            self.txt_pf_wander, self.sld_pf_wander, 0.0, 2.0)
+        pf_seed = self._ival(self.txt_pf_seed, self.sld_pf_seed)
+
+        self.lbl_path_status.Text = "Running pathfinding..."
+        trails = self.pathfinder.find_paths(
+            max_steps, branch_prob, max_branches,
+            density_str, attr_str, attr_r,
+            momentum, separation, wander, pf_seed)
+
+        self.system.conduit.path_trails = trails
+        self.system.conduit.path_points = list(self.pathfinder.start_points)
+        self._update_path_display()
+
+        total_pts = sum(len(t) for t in trails)
+        self.lbl_path_status.Text = "{} paths, {} segments".format(
+            len(trails), total_pts)
+
+    def _on_clear_paths(self, sender, e):
+        """Clear all paths from display."""
+        self.pathfinder.trails = []
+        self.system.conduit.path_trails = []
+        self.system.conduit.path_points = []
+        sc.doc.Views.Redraw()
+        self.lbl_path_status.Text = "Paths: 0"
+
+    def _on_bake_paths(self, sender, e):
+        """Bake path trails as polyline curves and start points to the document."""
+        trails = self.pathfinder.trails
+        if not trails:
+            self.lbl_path_status.Text = "No paths to bake"
+            return
+        count = 0
+        for trail in trails:
+            if len(trail) > 1:
+                plc = rg.PolylineCurve(trail)
+                sc.doc.Objects.AddCurve(plc)
+                count += 1
+        for sp in self.pathfinder.start_points:
+            sc.doc.Objects.AddPoint(sp)
+        sc.doc.Views.Redraw()
+        self.lbl_path_status.Text = "Baked {} paths + {} pts".format(
+            count, len(self.pathfinder.start_points))
+
+    # -- colour pickers for paths and points --------------------------------
+    def _on_pick_path_color(self, sender, e):
+        cd = forms.ColorDialog()
+        pc = self.system.conduit.path_color
+        cd.Color = drawing.Color.FromArgb(pc.R, pc.G, pc.B)
+        if cd.ShowDialog(self) == forms.DialogResult.Ok:
+            c = cd.Color
+            self.system.conduit.path_color = System.Drawing.Color.FromArgb(
+                c.Rb, c.Gb, c.Bb)
+            self.btn_path_col.BackgroundColor = c
+            sc.doc.Views.Redraw()
+
+    def _on_pick_point_color(self, sender, e):
+        cd = forms.ColorDialog()
+        pc = self.system.conduit.path_point_color
+        cd.Color = drawing.Color.FromArgb(pc.R, pc.G, pc.B)
+        if cd.ShowDialog(self) == forms.DialogResult.Ok:
+            c = cd.Color
+            self.system.conduit.path_point_color = System.Drawing.Color.FromArgb(
+                c.Rb, c.Gb, c.Bb)
+            self.btn_pt_col.BackgroundColor = c
+            sc.doc.Views.Redraw()
 
 
 # ---------------------------------------------------------------------------
