@@ -1,0 +1,39 @@
+---
+description: Project structure and workflow for this Rhino Python lab
+globs: **/*
+alwaysApply: true
+---
+
+# Project Rules
+
+## Repository Purpose
+This is a Rhino Python lab for procedural geometry experiments, reusable tools, and shared helper libraries. Scripts are written in Cursor and run inside Rhino's Python editor.
+
+## Directory Layout
+- `experiments/` — dated, self-contained studies (disposable)
+- `tools/` — promoted scripts with UI wrappers (stable)
+- `lib/` — shared helper modules imported by experiments and tools
+- `docs/` — setup guide, conventions, experiment log
+- `assets/` — sample geometry and screenshots
+- `tests/smoke/` — lightweight sanity checks
+
+## Key Conventions
+- Experiments are named `YYYY-MM-topic/` and contain `script.py`, `notes.md`, and optionally `sample_inputs/`
+- Tools contain `script.py` (logic), `ui.py` (Rhino UI), and `notes.md`
+- All scripts add `lib/` to `sys.path` to access shared helpers
+- See `PROJECT_CONTEXT.md` for full runtime and API details
+- See `docs/conventions.md` for naming and style rules
+
+## When Generating Code
+- Target IronPython 2.7 (no f-strings, no pathlib, no typing)
+- Use `rhinoscriptsyntax` (as `rs`) for high-level ops, `Rhino.Geometry` (as `rg`) for low-level
+- Include `scriptcontext` (as `sc`) when accessing the document or sticky dict
+- Always add a `sys.path` insert for `lib/` at the top of experiment and tool scripts
+- Prefer extracting reusable logic into `lib/` rather than duplicating across scripts
+
+## Documentation
+- **Always update `notes.md`** when adding, changing, or removing functionality in any experiment or tool
+- Document new parameters, modes, and features with their ranges, defaults, and effects
+- Keep the parameter tables and architecture sections current with the actual code
+- Mark completed ideas as `[x]` in the Ideas to Explore list
+- If a new experiment or tool is created, generate a `notes.md` alongside it

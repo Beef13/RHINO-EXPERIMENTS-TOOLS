@@ -1,0 +1,46 @@
+---
+description: Python style and IronPython 2.7 constraints
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# Python Rules (IronPython 2.7)
+
+## Language Constraints
+- **No f-strings** — use `str.format()` or `%` formatting
+- **No pathlib** — use `os.path` functions
+- **No type hints** — IronPython 2.7 does not support them
+- **No walrus operator** (`:=`), no `dataclasses`, no `async/await`
+- **Limited stdlib** — many Python 3 modules are unavailable
+- Print statements use `print()` function (Rhino's IronPython supports both, prefer function form)
+
+## Style
+- Use snake_case for functions, variables, and module names
+- Use PascalCase only when wrapping RhinoCommon classes
+- Keep functions short and focused
+- Add docstrings to all public functions in `lib/`
+- Use descriptive variable names — avoid single letters except for loop counters and coordinates (x, y, z, i, j, k, u, v)
+
+## Imports
+Standard import order:
+```python
+import sys
+import os
+
+import rhinoscriptsyntax as rs
+import Rhino.Geometry as rg
+import scriptcontext as sc
+
+# lib imports (after sys.path setup)
+from geometry.attractors import point_attractor
+```
+
+## Error Handling
+- Use `try/except` around Rhino API calls that might fail (selection, file I/O)
+- Print meaningful error messages with `print("Error: ...")`
+- Never silently swallow exceptions in lib modules
+
+## Common Patterns
+- Check for user escape: `if sc.escape_test(False): break`
+- Redraw control: `rs.EnableRedraw(False)` / `rs.EnableRedraw(True)`
+- Sticky variables: `sc.sticky["key"] = value`

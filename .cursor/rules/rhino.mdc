@@ -1,0 +1,61 @@
+---
+description: Rhino API patterns and best practices
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# Rhino API Rules
+
+## API Choice
+- Use `rhinoscriptsyntax` (rs) for quick, high-level operations
+- Use `Rhino.Geometry` (rg) when you need precise control, performance, or access to methods rs doesn't wrap
+- Don't mix both in the same function unless necessary — pick one level of abstraction
+
+## rhinoscriptsyntax Conventions
+```python
+import rhinoscriptsyntax as rs
+
+# Selection — always validate
+obj = rs.GetObject("Select a curve", rs.filter.curve)
+if obj is None:
+    print("Nothing selected")
+    # exit gracefully
+
+# Geometry queries return points as tuples (x, y, z)
+pt = rs.CurveStartPoint(curve_id)
+
+# Object creation returns a GUID
+circle_id = rs.AddCircle(center, radius)
+```
+
+## RhinoCommon Conventions
+```python
+import Rhino.Geometry as rg
+
+# Geometry objects are .NET types — construct explicitly
+pt = rg.Point3d(0, 0, 0)
+vec = rg.Vector3d(1, 0, 0)
+plane = rg.Plane(pt, vec)
+
+# Add to document via scriptcontext
+sc.doc.Objects.AddPoint(pt)
+sc.doc.Views.Redraw()
+```
+
+## Performance
+- Wrap batch operations in `rs.EnableRedraw(False)` / `rs.EnableRedraw(True)`
+- For large geometry sets (>1000 objects), prefer RhinoCommon over rhinoscriptsyntax
+- Use `sc.escape_test(False)` in long loops so the user can cancel
+- Avoid calling `rs.Redraw()` inside tight loops
+
+## Layers
+- Create layers before adding objects: `rs.AddLayer("MyLayer")`
+- Set object layer at creation or with `rs.ObjectLayer(guid, "MyLayer")`
+- Use descriptive layer names matching the experiment or tool name
+
+## Common Gotchas
+- `rs.GetObject()` returns `None` if the user cancels — always check
+- RhinoCommon `Point3d` is a value type — assignment copies, not references
+- `rs.coerce*` functions convert between rs GUIDs and RhinoCommon types
+- `sc.doc` vs `Rhino.RhinoDoc.ActiveDoc` — use `sc.doc` for GH compatibility
+- Boolean operations can fail silently — always check return values

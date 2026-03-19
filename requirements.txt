@@ -1,0 +1,9 @@
+# CPython 3.x dependencies for offline helpers and tests.
+# Rhino scripts run on IronPython 2.7 inside Rhino — these are NOT used there.
+
+# Geometry / math (optional, for offline prototyping)
+numpy>=1.24
+scipy>=1.10
+
+# Testing
+pytest>=7.0

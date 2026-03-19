@@ -1,0 +1,571 @@
+---
+description: Behavioural algorithm reference for computational architecture (attractors, growth, flocking, DLA, etc.)
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# ALGORITHM_LIBRARY.md
+### Behavioural Systems Reference for Computational Architecture
+
+This file provides a practical reference for implementing key behavioural algorithms in architectural workflows.
+
+It is intended to guide AI-generated scripts, Rhino Python tools, and Grasshopper definitions.
+
+The purpose is not scientific simulation accuracy, but **architectural usefulness**.
+
+---
+
+# 1. How to Use This File
+
+When generating tools or scripts, use these algorithms as **behaviour generators** for:
+
+- spatial organisation
+- circulation
+- clustering
+- facade articulation
+- material patterning
+- tectonic differentiation
+- environmental response systems
+
+For each algorithm, prioritise:
+
+- clear geometric logic
+- editable parameters
+- useful architectural outputs
+- real-time feedback where possible
+
+---
+
+# 2. Perlin Noise
+
+## Definition
+
+Perlin Noise is a smooth procedural noise function that creates continuous variation across space.
+
+It is useful when geometry should feel organic, gradient-based, and non-repetitive.
+
+Unlike true randomness, Perlin Noise produces neighbouring values that are related to each other.
+
+---
+
+## Architectural Behaviour
+
+Perlin Noise is best used for:
+
+- smooth field variation
+- density gradients
+- uneven but coherent distributions
+- non-repetitive surface articulation
+- gradual transitions between conditions
+
+---
+
+## Typical Architectural Applications
+
+- facade perforation density
+- panel depth variation
+- voxel field carving
+- wall thickness variation
+- landscape deformation
+- ceiling field modulation
+- shading gradients
+- spatial compression / expansion
+
+---
+
+## Typical Inputs
+
+- point coordinates
+- UV coordinates
+- voxel grid coordinates
+- noise scale
+- amplitude
+- seed
+- octaves / layers
+
+---
+
+## Typical Outputs
+
+- scalar values from 0 to 1
+- displacement values
+- density values
+- perforation sizes
+- local depth offsets
+- rotation values
+- subdivision thresholds
+
+---
+
+## Key Parameters
+
+- `noise_scale` -> controls how large or fine the noise pattern is
+- `amplitude` -> controls strength of the effect
+- `seed` -> changes noise variation
+- `octaves` -> increases complexity of the noise
+- `threshold` -> determines solid/void or active/inactive regions
+- `domain` -> remaps output values for architectural use
+
+---
+
+## Rhino / Grasshopper Implementation Strategy
+
+### Simple Workflow
+
+1. Create a point grid, panel grid, or voxel grid
+2. Sample Perlin noise at each point
+3. Store the resulting scalar value
+4. Use that value to control geometry:
+   - move points
+   - scale openings
+   - cull cells
+   - vary thickness
+   - change extrusion depth
+5. Update geometry in real time when parameters change
+
+---
+
+## Design Notes
+
+Use Perlin Noise when the design needs:
+
+- soft gradients instead of rigid repetition
+- natural-looking variation
+- smooth field-driven geometry
+- distributed performance responses
+
+Avoid using it only for decoration. Try to link it to:
+
+- view quality
+- solar response
+- privacy gradients
+- porosity control
+- program intensity
+
+---
+
+# 3. Attractors
+
+## Definition
+
+Attractors are influential objects that affect nearby geometry based on distance.
+
+An attractor can be:
+
+- a point
+- a curve
+- a polyline
+- a surface
+- a direction vector
+- a group of anchors
+
+The closer geometry is to the attractor, the stronger the effect.
+
+---
+
+## Architectural Behaviour
+
+Attractors create:
+
+- hierarchy
+- concentration
+- directional pull
+- local intensification
+- relational geometry
+- spatial emphasis
+
+---
+
+## Typical Architectural Applications
+
+- facade openings toward views
+- shading variation near solar exposure zones
+- circulation around entry points
+- clustering of programs around anchors
+- furniture aggregation
+- partition density near activity hubs
+- structural thickening near force concentrations
+
+---
+
+## Typical Inputs
+
+- attractor point(s)
+- attractor curve(s)
+- sample geometry points
+- influence radius
+- falloff type
+- strength factor
+- min / max output values
+
+---
+
+## Typical Outputs
+
+- distance values
+- remapped scalar fields
+- variable radii
+- extrusion depth
+- aperture scale
+- local density
+- movement vectors
+- deformation magnitude
+
+---
+
+## Key Parameters
+
+- `attractor_type` -> point, curve, surface, etc.
+- `strength` -> effect intensity
+- `radius` -> max influence distance
+- `falloff` -> linear, exponential, inverse, smoothstep
+- `min_value` -> lower bound of effect
+- `max_value` -> upper bound of effect
+- `blend_mode` -> how multiple attractors combine
+
+---
+
+## Rhino / Grasshopper Implementation Strategy
+
+### Simple Workflow
+
+1. Define attractor geometry
+2. Sample distances from design geometry to attractor
+3. Remap distance values to a useful range
+4. Apply those values to geometry:
+   - opening size
+   - offset distance
+   - density
+   - thickness
+   - height
+   - panel rotation
+5. Recompute interactively as attractor moves
+
+---
+
+## Design Notes
+
+Use attractors when architecture should respond to:
+
+- entrances
+- views
+- circulation paths
+- program nodes
+- environmental forces
+- site boundaries
+
+Attractors are one of the most useful systems for creating **clear architectural legibility** because they establish a readable relationship between cause and effect.
+
+---
+
+# 4. Boids
+
+## Definition
+
+Boids are autonomous agents that follow simple local rules to generate emergent flocking behaviour.
+
+The classic rules are:
+
+- separation
+- alignment
+- cohesion
+
+This produces collective motion without central control.
+
+---
+
+## Architectural Behaviour
+
+Boids create:
+
+- flocking
+- swarming
+- dynamic clustering
+- emergent circulation paths
+- collective directionality
+- distributed self-organisation
+
+---
+
+## Typical Architectural Applications
+
+- circulation simulations
+- crowd movement studies
+- path generation
+- spatial clustering logic
+- adaptive furniture systems
+- robotic placement systems
+- moving screen systems
+- dynamic occupancy mapping
+
+---
+
+## Typical Inputs
+
+- initial agent positions
+- initial agent velocities
+- boundary geometry
+- obstacles
+- target attractors
+- separation radius
+- alignment radius
+- cohesion radius
+- speed limits
+- steering strength
+
+---
+
+## Typical Outputs
+
+- agent trajectories
+- movement vectors
+- path networks
+- density fields
+- cluster behaviour
+- emergent linework
+- occupation maps
+
+---
+
+## Key Parameters
+
+- `agent_count`
+- `max_speed`
+- `max_force`
+- `separation_radius`
+- `alignment_radius`
+- `cohesion_radius`
+- `separation_weight`
+- `alignment_weight`
+- `cohesion_weight`
+- `boundary_mode`
+- `obstacle_avoidance_strength`
+- `target_attractor_strength`
+
+---
+
+## Rhino / Grasshopper Implementation Strategy
+
+### Simple Workflow
+
+1. Spawn agents in space or on a surface
+2. Assign each agent a position and velocity
+3. At each time step:
+   - calculate neighbours
+   - apply separation
+   - apply alignment
+   - apply cohesion
+   - optionally apply attractor or obstacle forces
+4. Update positions
+5. Draw trails, points, polylines, or derived geometry
+6. Allow play / pause / reset / resume behaviour
+
+---
+
+## Design Notes
+
+Boids are especially useful when the goal is not static composition but **behavioural organisation over time**.
+
+Architectural use should focus on:
+
+- movement patterns
+- relational organisation
+- adaptive systems
+- circulation emergence
+- distributed logic
+
+Do not use boids just to make abstract swirls unless that motion becomes spatially meaningful.
+
+---
+
+# 5. Reaction-Diffusion
+
+## Definition
+
+Reaction-Diffusion is a pattern formation process in which local interactions produce self-organising textures such as spots, stripes, and cellular formations.
+
+In design workflows, it is useful as a generative pattern engine rather than a scientific chemistry simulator.
+
+---
+
+## Architectural Behaviour
+
+Reaction-Diffusion creates:
+
+- spots
+- stripes
+- cellular fields
+- branching edges
+- porous textures
+- growth-like material differentiation
+
+---
+
+## Typical Architectural Applications
+
+- perforated skins
+- facade patterning
+- acoustic panels
+- porous partitions
+- light-filtering screens
+- textured wall systems
+- cellular fabrication logics
+- graded material interfaces
+
+---
+
+## Typical Inputs
+
+- 2D grid or surface UV grid
+- initial seeded pattern
+- feed rate
+- kill rate
+- diffusion rates
+- iteration count
+- threshold values
+- remap values for geometry conversion
+
+---
+
+## Typical Outputs
+
+- grayscale field
+- cellular mask
+- spot / stripe regions
+- contour curves
+- perforation zones
+- porous density maps
+- displacement textures
+
+---
+
+## Key Parameters
+
+- `grid_resolution`
+- `feed_rate`
+- `kill_rate`
+- `diffusion_a`
+- `diffusion_b`
+- `iterations`
+- `threshold`
+- `smoothing`
+- `seed_pattern`
+
+---
+
+## Rhino / Grasshopper Implementation Strategy
+
+### Simple Workflow
+
+1. Create a 2D simulation grid
+2. Seed initial values or pattern zones
+3. Iterate reaction-diffusion update equations
+4. Store scalar values in the grid
+5. Convert result into geometry:
+   - image map
+   - contour curves
+   - panel openings
+   - extrusion fields
+   - perforation masks
+6. Rebuild geometry from the final field
+
+---
+
+## Design Notes
+
+Reaction-Diffusion is strongest when used for:
+
+- tectonic skin systems
+- porous interfaces
+- self-organised ornament
+- non-repetitive material logic
+
+It is most useful when the resulting pattern is translated into real architectural variables such as:
+
+- aperture size
+- void distribution
+- relief depth
+- acoustic texture
+- solar filtering
+
+---
+
+# 6. Choosing the Right Algorithm
+
+## Use Perlin Noise when you need:
+- smooth variation
+- gradients
+- soft density shifts
+- natural but controlled irregularity
+
+## Use Attractors when you need:
+- spatial hierarchy
+- response to important nodes
+- view-based or entry-based organisation
+- proximity-driven change
+
+## Use Boids when you need:
+- movement logic
+- circulation generation
+- multi-agent behaviour
+- emergent organisation over time
+
+## Use Reaction-Diffusion when you need:
+- self-organising surface pattern
+- cellular skins
+- porous fields
+- material-like growth logic
+
+---
+
+# 7. Recommended Hybrid Strategies
+
+These algorithms can be combined.
+
+## Examples
+
+### Perlin Noise + Attractors
+Use noise for broad variation and attractors for local control.
+
+### Boids + Attractors
+Use attractors as goals while boids generate dynamic circulation paths.
+
+### Reaction-Diffusion + Attractors
+Use reaction-diffusion for pattern growth, then bias the result near views or environmental zones.
+
+### Perlin Noise + Reaction-Diffusion
+Use noise to seed or distort the pattern field for more varied outcomes.
+
+---
+
+# 8. General Scripting Guidance
+
+When generating scripts for these algorithms:
+
+- keep code modular
+- separate simulation logic from geometry generation
+- expose important parameters in UI
+- support sliders and typed inputs
+- allow reset / recompute
+- enable live updates where possible
+- support geometry assignment buttons for curves, meshes, surfaces, or attractors
+- document parameters clearly
+- ensure stable performance for medium-sized models
+
+---
+
+# 9. Expected Design Mindset
+
+These algorithms are not purely visual effects.
+
+They should be used to generate:
+
+- architectural organisation
+- tectonic logic
+- performative differentiation
+- relational behaviour
+- multi-scalar spatial systems
+
+The output should always be interpretable as an architectural response, not just an abstract graphic.
+
+---
