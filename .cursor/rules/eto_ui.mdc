@@ -1,0 +1,184 @@
+---
+description: Eto.Forms UI styling standards for all Rhino Python dialogs
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# Eto UI Styling Rules
+
+All Eto.Forms dialogs in this project must follow these styling conventions for a consistent, clean, minimal look.
+
+## Imports
+```python
+import Eto.Forms as forms
+import Eto.Drawing as drawing
+```
+
+## Window Setup
+```python
+self.Padding = drawing.Padding(6)
+self.Resizable = True
+self.MinimumSize = drawing.Size(420, 700)
+self.Size = drawing.Size(420, 800)
+```
+- Minimum width **420px** — fits label + slider + textbox rows with scrollbar
+- Always `Resizable = True`
+
+## Scrollable Root
+Wrap the main layout in a `Scrollable` with `ExpandContentWidth = True` so content stretches horizontally:
+```python
+scrollable = forms.Scrollable()
+scrollable.ExpandContentWidth = True
+scrollable.Content = layout
+self.Content = scrollable
+```
+
+## Main Layout
+```python
+layout = forms.DynamicLayout()
+layout.DefaultSpacing = drawing.Size(4, 2)
+layout.DefaultPadding = drawing.Padding(4)
+```
+
+## Collapsible Sections (instead of Expander)
+Do **not** use `forms.Expander`. Use custom collapsible sections with arrow indicators:
+```python
+def _section(self, parent_layout, title, expanded=False):
+    arrow_open = u"\u25BC "    # ▼
+    arrow_closed = u"\u25B6 "  # ▶
+
+    header = forms.Label()
+    header.Text = (arrow_open if expanded else arrow_closed) + title
+    header.Font = drawing.Font(header.Font.Family,
+                               header.Font.Size + 1,
+                               drawing.FontStyle.Bold)
+    header.Cursor = forms.Cursors.Pointer
+
+    panel = forms.DynamicLayout()
+    panel.DefaultSpacing = drawing.Size(4, 4)
+    panel.Padding = drawing.Padding(8, 4, 4, 4)
+    panel.Visible = expanded
+
+    def toggle(sender, e):
+        panel.Visible = not panel.Visible
+        if panel.Visible:
+            header.Text = arrow_open + title
+        else:
+            header.Text = arrow_closed + title
+
+    header.MouseDown += toggle
+
+    sep = forms.Label()
+    sep.Text = ""
+    sep.Height = 2
+
+    def finish():
+        parent_layout.AddRow(sep)
+        parent_layout.AddRow(header)
+        parent_layout.AddRow(panel)
+
+    return panel, finish
+```
+Usage:
+```python
+inner, _sec_finish = self._section(layout, "Section Name", True)
+inner.AddRow(...)
+_sec_finish()
+```
+
+## Section Headers (inside a section)
+Bold sub-headers within a collapsible section:
+```python
+lbl = forms.Label()
+lbl.Text = "Sub-Section Title"
+lbl.Font = drawing.Font(lbl.Font.Family, lbl.Font.Size, drawing.FontStyle.Bold)
+inner.AddRow(lbl)
+```
+Add a `None` row before each sub-header for spacing:
+```python
+inner.AddRow(None)
+inner.AddRow(lbl)
+```
+
+## Slider Rows (label + slider + textbox)
+Fixed widths for alignment:
+- **Label**: `Width = 105`
+- **Slider**: `Width = 150`
+- **TextBox**: `Width = 50`
+```python
+lbl = forms.Label()
+lbl.Text = name
+lbl.Width = 105
+
+sld = forms.Slider()
+sld.Width = 150
+
+txt = forms.TextBox()
+txt.Width = 50
+
+layout.AddRow(lbl, sld, txt)
+```
+
+## Dropdowns
+Always set a fixed width matching the slider:
+```python
+dd = forms.DropDown()
+dd.Width = 150
+```
+Place alongside a label with `Width = 105`.
+
+## Buttons
+- Standard action buttons: no fixed width (auto-size), placed 2–3 per row
+- Compact button rows (assign/clear): use `Width = 80` for action buttons, `Width = 50` for clear buttons
+- Colour picker buttons: `Width = 120`
+```python
+btn = forms.Button()
+btn.Text = "Action"
+btn.Width = 80
+```
+
+## Colour Picker Buttons
+Show the current colour as the button background:
+```python
+btn = forms.Button()
+btn.Text = "Path Colour"
+btn.Width = 120
+btn.BackgroundColor = drawing.Color.FromArgb(255, 200, 50)
+```
+
+## Count Labels (inline with buttons)
+Small labels showing counts next to assign/clear buttons:
+```python
+lbl = forms.Label()
+lbl.Text = "0"
+lbl.Width = 30
+```
+Update with just the number (e.g., `lbl.Text = str(count)`), not verbose prefixes.
+
+## Checkboxes
+Place 2 checkboxes per row when they are related toggles:
+```python
+inner.AddRow(chk_a, chk_b)
+```
+
+## Spacing Rules
+- Use `inner.AddRow(None)` between logical sub-sections for visual breathing room
+- Section panel padding: `Padding(8, 4, 4, 4)` — slight left indent for hierarchy
+- Default spacing inside sections: `Size(4, 4)`
+- Default spacing on outer layout: `Size(4, 2)` — tighter vertical rhythm between sections
+
+## Status Labels
+For operation feedback, use a plain label updated dynamically:
+```python
+self.lbl_status = forms.Label()
+self.lbl_status.Text = "Ready"
+```
+
+## General Principles
+- **No `forms.Expander`** — always use the custom `_section` pattern with arrow indicators
+- **Fixed element widths** — labels 105, sliders 150, textboxes 50, dropdowns 150
+- **Compact labels** — show counts as plain numbers, not verbose strings
+- **Consistent padding** across all sections
+- **Bold for hierarchy** — section headers are bold+1pt, sub-headers are bold
+- **Hand cursor** on clickable section headers
+- **Minimal separators** — 2px empty labels between sections, `None` rows between sub-sections

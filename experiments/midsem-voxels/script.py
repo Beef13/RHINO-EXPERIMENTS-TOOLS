@@ -8,7 +8,6 @@ import Rhino
 import Rhino.Geometry as rg
 import Rhino.Display as rd
 import scriptcontext as sc
-import rhinoscriptsyntax as rs
 import System
 import System.Drawing
 import math
@@ -29,43 +28,51 @@ except:
 # density field for voxel generation.
 # ---------------------------------------------------------------------------
 class PerlinNoise(object):
+    _GRAD3 = (
+        (1,1,0),(-1,1,0),(1,-1,0),(-1,-1,0),
+        (1,0,1),(-1,0,1),(1,0,-1),(-1,0,-1),
+        (0,1,1),(0,-1,1),(0,1,-1),(0,-1,-1),
+        (1,1,0),(-1,1,0),(0,-1,1),(0,-1,-1),
+    )
     def __init__(self, seed=0):
-        """Build a shuffled permutation table from the given seed."""
         random.seed(seed)
-        self.p = list(range(256))
-        random.shuffle(self.p)
-        self.p *= 2
+        p = list(range(256))
+        random.shuffle(p)
+        self.p = p + p
+        g3 = self._GRAD3
+        pp = self.p
+        self._g12 = tuple(
+            (g3[pp[i] & 15][0], g3[pp[i] & 15][1], g3[pp[i] & 15][2])
+            for i in range(512))
 
     def noise3d(self, x, y, z):
-        """Single-octave 3D Perlin noise with inlined fade/lerp/grad for speed."""
         p = self.p
-        _floor = math.floor
-        xi = int(_floor(x)); yi = int(_floor(y)); zi = int(_floor(z))
+        g12 = self._g12
+        xi = int(x) if x >= 0 else int(x) - (1 if x != int(x) else 0)
+        yi = int(y) if y >= 0 else int(y) - (1 if y != int(y) else 0)
+        zi = int(z) if z >= 0 else int(z) - (1 if z != int(z) else 0)
         X = xi & 255; Y = yi & 255; Z = zi & 255
-        x -= xi; y -= yi; z -= zi
-        u = x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
-        v = y * y * y * (y * (y * 6.0 - 15.0) + 10.0)
-        w = z * z * z * (z * (z * 6.0 - 15.0) + 10.0)
+        xf = x - xi; yf = y - yi; zf = z - zi
+        u = xf * xf * xf * (xf * (xf * 6.0 - 15.0) + 10.0)
+        v = yf * yf * yf * (yf * (yf * 6.0 - 15.0) + 10.0)
+        w = zf * zf * zf * (zf * (zf * 6.0 - 15.0) + 10.0)
         A = p[X] + Y; AA = p[A] + Z; AB = p[A + 1] + Z
         B = p[X + 1] + Y; BA = p[B] + Z; BB = p[B + 1] + Z
-        x1 = x - 1.0; y1 = y - 1.0; z1 = z - 1.0
-        def _g(h, gx, gy, gz):
-            h &= 15
-            a = gx if h < 8 else gy
-            b = gy if h < 4 else (gx if h == 12 or h == 14 else gz)
-            return (a if (h & 1) == 0 else -a) + (b if (h & 2) == 0 else -b)
-        g0 = _g(p[AA], x, y, z);     g1 = _g(p[BA], x1, y, z)
-        g2 = _g(p[AB], x, y1, z);    g3 = _g(p[BB], x1, y1, z)
-        g4 = _g(p[AA+1], x, y, z1);  g5 = _g(p[BA+1], x1, y, z1)
-        g6 = _g(p[AB+1], x, y1, z1); g7 = _g(p[BB+1], x1, y1, z1)
+        xf1 = xf - 1.0; yf1 = yf - 1.0; zf1 = zf - 1.0
+        ga = g12[AA];  g0 = ga[0]*xf  + ga[1]*yf  + ga[2]*zf
+        ga = g12[BA];  g1 = ga[0]*xf1 + ga[1]*yf  + ga[2]*zf
+        ga = g12[AB];  g2 = ga[0]*xf  + ga[1]*yf1 + ga[2]*zf
+        ga = g12[BB];  g3 = ga[0]*xf1 + ga[1]*yf1 + ga[2]*zf
+        ga = g12[AA+1];g4 = ga[0]*xf  + ga[1]*yf  + ga[2]*zf1
+        ga = g12[BA+1];g5 = ga[0]*xf1 + ga[1]*yf  + ga[2]*zf1
+        ga = g12[AB+1];g6 = ga[0]*xf  + ga[1]*yf1 + ga[2]*zf1
+        ga = g12[BB+1];g7 = ga[0]*xf1 + ga[1]*yf1 + ga[2]*zf1
         l0 = g0 + u * (g1 - g0); l1 = g2 + u * (g3 - g2)
         l2 = g4 + u * (g5 - g4); l3 = g6 + u * (g7 - g6)
         m0 = l0 + v * (l1 - l0); m1 = l2 + v * (l3 - l2)
         return m0 + w * (m1 - m0)
 
     def octave_noise(self, x, y, z, octaves=1):
-        """Layer multiple noise frequencies (octaves) for richer detail.
-        Each octave doubles frequency and halves amplitude."""
         val = 0.0; freq = 1.0; amp = 1.0; max_amp = 0.0
         n3d = self.noise3d
         for _ in range(octaves):
@@ -89,52 +96,112 @@ class VoxelConduit(rd.DisplayConduit):
         self.bound_lines = []
         self.bound_color = System.Drawing.Color.FromArgb(80, 80, 80)
         self.edge_color = System.Drawing.Color.FromArgb(40, 40, 40)
+        self.edge_opacity = 255
         self.show_bounds = True
         self.show_edges = True
         self.show_voxels = True
         self.use_vertex_colors = True
         self.shaded_material = rd.DisplayMaterial()
         self.voxel_opacity = 255
-        self.path_trails = []
-        self.path_color = System.Drawing.Color.FromArgb(255, 200, 50)
-        self.path_thickness = 2
-        self.show_paths = True
+        self._cached_trans_mat = None
+        self._cached_trans_opacity = -1
+        self.wander_trails = []
+        self.wander_color = System.Drawing.Color.FromArgb(255, 200, 50)
+        self.wander_opacity = 255
+        self.wander_thickness = 2
+        self.show_wander = True
+
+        self.slime_trails = []
+        self.slime_color = System.Drawing.Color.FromArgb(50, 220, 120)
+        self.slime_opacity = 255
+        self.slime_thickness = 2
+        self.show_slime = True
+
         self.path_points = []
         self.path_point_color = System.Drawing.Color.FromArgb(255, 80, 80)
         self.path_point_size = 8
         self.show_path_points = True
+        self._cached_edge_color = None
+        self._cached_eo = -1
+
+        self.influence_trails = []
+        self.influence_color = System.Drawing.Color.FromArgb(255, 130, 50)
+        self.influence_thickness = 2
+        self.show_influence = True
 
     def CalculateBoundingBox(self, e):
-        """Expand the viewport clipping box to include all displayed geometry."""
         if self.bbox.IsValid:
             e.IncludeBoundingBox(self.bbox)
 
     def PostDrawObjects(self, e):
-        """Draw voxel mesh (with opacity), edges, bounds, paths, and points."""
+        disp = e.Display
         if self.show_voxels and self.mesh and self.mesh.Vertices.Count > 0:
             if self.voxel_opacity >= 255:
                 if self.use_vertex_colors:
-                    e.Display.DrawMeshFalseColors(self.mesh)
+                    disp.DrawMeshFalseColors(self.mesh)
                 else:
-                    e.Display.DrawMeshShaded(self.mesh, self.shaded_material)
+                    disp.DrawMeshShaded(self.mesh, self.shaded_material)
             else:
-                mat = rd.DisplayMaterial(self.shaded_material)
-                mat.Transparency = 1.0 - self.voxel_opacity / 255.0
-                e.Display.DrawMeshShaded(self.mesh, mat)
+                op = self.voxel_opacity
+                if op != self._cached_trans_opacity:
+                    mat = rd.DisplayMaterial(self.shaded_material)
+                    mat.Transparency = 1.0 - op / 255.0
+                    self._cached_trans_mat = mat
+                    self._cached_trans_opacity = op
+                disp.DrawMeshShaded(self.mesh, self._cached_trans_mat)
             if self.show_edges:
                 wire = self.edge_mesh if self.edge_mesh else self.mesh
-                e.Display.DrawMeshWires(wire, self.edge_color)
+                eo = self.edge_opacity
+                ec = self.edge_color
+                if eo < 255:
+                    if self._cached_edge_color is None or eo != self._cached_eo:
+                        self._cached_edge_color = System.Drawing.Color.FromArgb(
+                            eo, ec.R, ec.G, ec.B)
+                        self._cached_eo = eo
+                    ec = self._cached_edge_color
+                disp.DrawMeshWires(wire, ec)
         if self.show_bounds and self.bound_lines:
+            bc = self.bound_color
+            _dl = disp.DrawLine
             for ln in self.bound_lines:
-                e.Display.DrawLine(ln, self.bound_color, 1)
-        if self.show_paths and self.path_trails:
-            for trail in self.path_trails:
+                _dl(ln, bc, 1)
+
+    def DrawForeground(self, e):
+        disp = e.Display
+        if self.show_wander and self.wander_trails:
+            wc = self.wander_color
+            if self.wander_opacity < 255:
+                wc = System.Drawing.Color.FromArgb(
+                    self.wander_opacity, wc.R, wc.G, wc.B)
+            wt = self.wander_thickness
+            _dp = disp.DrawPolyline
+            for trail in self.wander_trails:
                 if len(trail) > 1:
-                    e.Display.DrawPolyline(trail, self.path_color, self.path_thickness)
+                    _dp(trail, wc, wt)
+        if self.show_slime and self.slime_trails:
+            sc_col = self.slime_color
+            if self.slime_opacity < 255:
+                sc_col = System.Drawing.Color.FromArgb(
+                    self.slime_opacity, sc_col.R, sc_col.G, sc_col.B)
+            st = self.slime_thickness
+            _dp = disp.DrawPolyline
+            for trail in self.slime_trails:
+                if len(trail) > 1:
+                    _dp(trail, sc_col, st)
+        if self.show_influence and self.influence_trails:
+            ic = self.influence_color
+            it = self.influence_thickness
+            _dp = disp.DrawPolyline
+            for trail in self.influence_trails:
+                if len(trail) > 1:
+                    _dp(trail, ic, it)
         if self.show_path_points and self.path_points:
+            _dppt = disp.DrawPoint
+            _style = rd.PointStyle.RoundControlPoint
+            ps = self.path_point_size
+            pc = self.path_point_color
             for pt in self.path_points:
-                e.Display.DrawPoint(pt, rd.PointStyle.RoundControlPoint,
-                                    self.path_point_size, self.path_point_color)
+                _dppt(pt, _style, ps, pc)
 
 
 # ---------------------------------------------------------------------------
@@ -173,35 +240,74 @@ class VoxelSystem(object):
             pass
         return float('inf')
 
+    def _build_influence_field(self, path_keys, cell_radius, is_bcc):
+        """Pre-expand path keys into an influence dict.
+        Maps (fx, fy, fz) -> min_squared_cell_distance for every grid
+        position within cell_radius of any path key.  O(1) lookup per voxel."""
+        influence = {}
+        R = cell_radius
+        R_sq = float(R * R)
+        _get = influence.get
+        _range = range(-R, R + 1)
+        for pk in path_keys:
+            px, py, pz = pk
+            for dx in _range:
+                dx_sq = dx * dx
+                if dx_sq > R_sq:
+                    continue
+                for dy in _range:
+                    dxy_sq = dx_sq + dy * dy
+                    if dxy_sq > R_sq:
+                        continue
+                    for dz in _range:
+                        dsq = dxy_sq + dz * dz
+                        if dsq <= R_sq:
+                            k = (px + dx, py + dy, pz + dz)
+                            old = _get(k)
+                            if old is None or dsq < old:
+                                influence[k] = dsq
+                        if is_bcc:
+                            fx = dx + 0.5; fy = dy + 0.5; fz = dz + 0.5
+                            dsq2 = fx * fx + fy * fy + fz * fz
+                            if dsq2 <= R_sq:
+                                k2 = (px + fx, py + fy, pz + fz)
+                                old2 = _get(k2)
+                                if old2 is None or dsq2 < old2:
+                                    influence[k2] = dsq2
+        return influence
+
     def generate(self, grid_x, grid_y, grid_z, cell_w, cell_l, cell_h,
                  noise_scale, threshold, octaves, seed,
-                 use_attractors, attractor_pts, attractor_curves, attractor_geos,
-                 attr_radius, attr_strength,
-                 use_base, base_geos, base_radius, base_strength, base_carve,
+                 use_paths, path_keys, path_cell_radius, path_strength,
+                 path_carve,
                  use_bounds, bounds_meshes, bounds_aabb, bounds_strict,
-                 fill_grid, grid_type, grid_origin):
-        """Sample Perlin noise across a 3D grid and collect voxels above threshold.
-        grid_type 0 = cubic, 1 = BCC (truncated octahedron). BCC mode adds
-        body-center positions at half-cell offsets. Returns list of
-        (fx, fy, fz, val) where fx/fy/fz are float grid indices."""
+                 grid_type, grid_origin):
+        """Generate voxel field.  Without paths the grid is filled solid.
+        When paths are supplied they act as attractors (concentrate) or
+        subtractors (carve) with Perlin noise providing organic variation.
+        Uses pre-expanded influence field keyed by grid indices for O(1)
+        detection of whether a voxel is near a path."""
         self.perlin = PerlinNoise(seed)
         oct_noise = self.perlin.octave_noise
-        _closest = self._closest_dist
         voxels = []
         _append = voxels.append
         ox = grid_origin.X; oy = grid_origin.Y; oz = grid_origin.Z
         hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
-        inv_attr_r = 1.0 / attr_radius if attr_radius > 1e-10 else 0.0
-        inv_base_r = 1.0 / base_radius if base_radius > 1e-10 else 0.0
-        need_pt = ((use_base and base_geos) or
-                   (use_attractors and (attractor_pts or attractor_curves or attractor_geos)) or
-                   (use_bounds and bounds_meshes))
-        half_bs = base_strength * 0.5
+        half_ps = path_strength * 0.5
+        _has_paths = use_paths and bool(path_keys)
         _Point3d = rg.Point3d
+        _sqrt = math.sqrt
+
+        if _has_paths:
+            influence = self._build_influence_field(
+                path_keys, path_cell_radius, grid_type == 1)
+            _inf_get = influence.get
+            _cr = float(path_cell_radius) if path_cell_radius > 0 else 1.0
+        else:
+            influence = None; _inf_get = None; _cr = 1.0
 
         if use_bounds and bounds_meshes and bounds_aabb and bounds_aabb.IsValid:
-            _bb_min = bounds_aabb.Min
-            _bb_max = bounds_aabb.Max
+            _bb_min = bounds_aabb.Min; _bb_max = bounds_aabb.Max
             bb_min_x = _bb_min.X; bb_min_y = _bb_min.Y; bb_min_z = _bb_min.Z
             bb_max_x = _bb_max.X; bb_max_y = _bb_max.Y; bb_max_z = _bb_max.Z
             _do_bounds = True
@@ -209,89 +315,117 @@ class VoxelSystem(object):
             _bounds_strict = bounds_strict
         else:
             _do_bounds = False
-            _bounds_meshes = None
-            _bounds_strict = False
+            _bounds_meshes = None; _bounds_strict = False
             bb_min_x = bb_min_y = bb_min_z = 0.0
             bb_max_x = bb_max_y = bb_max_z = 0.0
 
         positions = []
-        for ix in range(grid_x):
-            for iy in range(grid_y):
-                for iz in range(grid_z):
-                    positions.append((ix, iy, iz))
-                    if grid_type == 1:
-                        if ix < grid_x - 1 and iy < grid_y - 1 and iz < grid_z - 1:
-                            positions.append((ix + 0.5, iy + 0.5, iz + 0.5))
+        _pos_append = positions.append
+        if grid_type == 1:
+            gxm1 = grid_x - 1; gym1 = grid_y - 1; gzm1 = grid_z - 1
+            for ix in range(grid_x):
+                for iy in range(grid_y):
+                    for iz in range(grid_z):
+                        _pos_append((ix, iy, iz))
+                        if ix < gxm1 and iy < gym1 and iz < gzm1:
+                            _pos_append((ix + 0.5, iy + 0.5, iz + 0.5))
+        else:
+            for ix in range(grid_x):
+                for iy in range(grid_y):
+                    for iz in range(grid_z):
+                        _pos_append((ix, iy, iz))
 
-        for (fx, fy, fz) in positions:
-            cx_b = ox + fx * cell_w + hw
-            cy_b = oy + fy * cell_l + hl
-            cz_b = oz + fz * cell_h + hh
+        if _has_paths:
+            _carve = path_carve
+            _ps = path_strength
+            for (fx, fy, fz) in positions:
+                cx_b = ox + fx * cell_w + hw
+                cy_b = oy + fy * cell_l + hl
+                cz_b = oz + fz * cell_h + hh
 
-            if fill_grid:
-                val = 1.0
-            else:
                 val = oct_noise(fx * noise_scale, fy * noise_scale,
                                 fz * noise_scale, octaves)
                 val = (val + 1.0) * 0.5
 
-            if need_pt:
-                pt = _Point3d(cx_b, cy_b, cz_b)
-
-            if use_base and base_geos:
-                min_d = float('inf')
-                for geo in base_geos:
-                    d = _closest(pt, geo)
-                    if d < min_d:
-                        min_d = d
-                if base_carve:
-                    if min_d < base_radius:
-                        val -= (1.0 - min_d * inv_base_r) * base_strength
-                else:
-                    if min_d < base_radius:
-                        val += (1.0 - min_d * inv_base_r) * base_strength
+                inf_dsq = _inf_get((fx, fy, fz))
+                if inf_dsq is not None:
+                    d_norm = _sqrt(inf_dsq) / _cr
+                    if _carve:
+                        val -= (1.0 - d_norm) * _ps
                     else:
-                        val -= half_bs
+                        val += (1.0 - d_norm) * _ps
+                else:
+                    if not _carve:
+                        val -= half_ps
 
-            if use_attractors:
-                if attractor_pts:
-                    for apt in attractor_pts:
-                        d = pt.DistanceTo(apt)
-                        if d < attr_radius:
-                            val += (1.0 - d * inv_attr_r) * attr_strength
-                if attractor_curves:
-                    for crv in attractor_curves:
-                        d = _closest(pt, crv)
-                        if d < attr_radius:
-                            val += (1.0 - d * inv_attr_r) * attr_strength
-                if attractor_geos:
-                    for geo in attractor_geos:
-                        d = _closest(pt, geo)
-                        if d < attr_radius:
-                            val += (1.0 - d * inv_attr_r) * attr_strength
+                if val < 0.0:
+                    val = 0.0
+                elif val > 1.0:
+                    val = 1.0
 
-            if val < 0.0:
-                val = 0.0
-            elif val > 1.0:
-                val = 1.0
-
-            if val > threshold:
+                if val > threshold:
+                    if _do_bounds:
+                        if (cx_b < bb_min_x or cx_b > bb_max_x or
+                            cy_b < bb_min_y or cy_b > bb_max_y or
+                            cz_b < bb_min_z or cz_b > bb_max_z):
+                            continue
+                        if _bounds_strict:
+                            _corners_ok = True
+                            for cdx in (0.0, cell_w):
+                                for cdy in (0.0, cell_l):
+                                    for cdz in (0.0, cell_h):
+                                        cp = _Point3d(
+                                            ox + fx * cell_w + cdx,
+                                            oy + fy * cell_l + cdy,
+                                            oz + fz * cell_h + cdz)
+                                        _in = False
+                                        for bm in _bounds_meshes:
+                                            if bm.IsPointInside(
+                                                    cp, 0.001, False):
+                                                _in = True
+                                                break
+                                        if not _in:
+                                            _corners_ok = False
+                                            break
+                                    if not _corners_ok:
+                                        break
+                                if not _corners_ok:
+                                    break
+                            if not _corners_ok:
+                                continue
+                        else:
+                            pt = _Point3d(cx_b, cy_b, cz_b)
+                            _in = False
+                            for bm in _bounds_meshes:
+                                if bm.IsPointInside(pt, 0.001, False):
+                                    _in = True
+                                    break
+                            if not _in:
+                                continue
+                    _append((fx, fy, fz, val))
+        else:
+            for (fx, fy, fz) in positions:
                 if _do_bounds:
-                    if (pt.X < bb_min_x or pt.X > bb_max_x or
-                        pt.Y < bb_min_y or pt.Y > bb_max_y or
-                        pt.Z < bb_min_z or pt.Z > bb_max_z):
+                    cx_b = ox + fx * cell_w + hw
+                    cy_b = oy + fy * cell_l + hl
+                    cz_b = oz + fz * cell_h + hh
+                    if (cx_b < bb_min_x or cx_b > bb_max_x or
+                        cy_b < bb_min_y or cy_b > bb_max_y or
+                        cz_b < bb_min_z or cz_b > bb_max_z):
                         continue
                     if _bounds_strict:
                         _corners_ok = True
                         for cdx in (0.0, cell_w):
                             for cdy in (0.0, cell_l):
                                 for cdz in (0.0, cell_h):
-                                    cp = _Point3d(ox + fx * cell_w + cdx,
-                                                  oy + fy * cell_l + cdy,
-                                                  oz + fz * cell_h + cdz)
+                                    cp = _Point3d(
+                                        ox + fx * cell_w + cdx,
+                                        oy + fy * cell_l + cdy,
+                                        oz + fz * cell_h + cdz)
                                     _in = False
                                     for bm in _bounds_meshes:
-                                        if bm.IsPointInside(cp, 0.001, False):
+                                        if bm.IsPointInside(
+                                                cp, 0.001, False):
                                             _in = True
                                             break
                                     if not _in:
@@ -304,6 +438,7 @@ class VoxelSystem(object):
                         if not _corners_ok:
                             continue
                     else:
+                        pt = _Point3d(cx_b, cy_b, cz_b)
                         _in = False
                         for bm in _bounds_meshes:
                             if bm.IsPointInside(pt, 0.001, False):
@@ -311,8 +446,7 @@ class VoxelSystem(object):
                                 break
                         if not _in:
                             continue
-
-                _append((fx, fy, fz, val))
+                _append((fx, fy, fz, 1.0))
 
         self.voxels = voxels
         return voxels
@@ -345,50 +479,51 @@ class VoxelSystem(object):
 
     def build_mesh_custom(self, voxels, cell_w, cell_l, cell_h, color,
                           grid_origin, custom_scale):
-        """Build display mesh using the user-assigned custom shape at each voxel.
-        Falls back to build_mesh if no custom geo."""
+        """Build display mesh using custom shape. Cached method refs."""
         if not self.custom_base_mesh:
             return self.build_mesh(voxels, cell_w, cell_l, cell_h, color,
                                    grid_origin)
         mesh = rg.Mesh()
-        verts = mesh.Vertices
-        faces = mesh.Faces
-        colors = mesh.VertexColors
+        _va = mesh.Vertices.Add
+        _fa = mesh.Faces.AddFace
+        _ca = mesh.VertexColors.Add
         base = self.custom_base_mesh
         bv = base.Vertices; bf = base.Faces
         base_vcount = bv.Count; base_fcount = bf.Count
         ox0 = grid_origin.X; oy0 = grid_origin.Y; oz0 = grid_origin.Z
         cr = color.R; cg = color.G; cb = color.B
         _FromArgb = System.Drawing.Color.FromArgb
+        _int = int
 
-        bv_cache = [(bv[i].X, bv[i].Y, bv[i].Z) for i in range(base_vcount)]
-        bf_cache = []
+        bv_cache = tuple((bv[i].X, bv[i].Y, bv[i].Z) for i in range(base_vcount))
+        bf_quad = []
+        bf_tri = []
         for fi in range(base_fcount):
             f = bf[fi]
             if f.IsQuad:
-                bf_cache.append((f.A, f.B, f.C, f.D))
+                bf_quad.append((f.A, f.B, f.C, f.D))
             else:
-                bf_cache.append((f.A, f.B, f.C))
+                bf_tri.append((f.A, f.B, f.C))
+        bf_quad = tuple(bf_quad)
+        bf_tri = tuple(bf_tri)
 
         sx = cell_w * custom_scale
         sy = cell_l * custom_scale
         sz = cell_h * custom_scale
         hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
 
+        b = 0
         for (fx, fy, fz, val) in voxels:
             cx = ox0 + fx * cell_w + hw
             cy = oy0 + fy * cell_l + hl
             cz = oz0 + fz * cell_h + hh
-            base_idx = verts.Count
             for (bx, by, bz) in bv_cache:
-                verts.Add(bx * sx + cx, by * sy + cy, bz * sz + cz)
-            for fd in bf_cache:
-                if len(fd) == 4:
-                    faces.AddFace(fd[0]+base_idx, fd[1]+base_idx,
-                                  fd[2]+base_idx, fd[3]+base_idx)
-                else:
-                    faces.AddFace(fd[0]+base_idx, fd[1]+base_idx, fd[2]+base_idx)
-            rv = int(cr * val); gv = int(cg * val); bv_c = int(cb * val)
+                _va(bx * sx + cx, by * sy + cy, bz * sz + cz)
+            for (a, b2, c, d) in bf_quad:
+                _fa(a+b, b2+b, c+b, d+b)
+            for (a, b2, c) in bf_tri:
+                _fa(a+b, b2+b, c+b)
+            rv = _int(cr * val); gv = _int(cg * val); bv_c = _int(cb * val)
             if rv < 30: rv = 30
             elif rv > 255: rv = 255
             if gv < 30: gv = 30
@@ -397,10 +532,9 @@ class VoxelSystem(object):
             elif bv_c > 255: bv_c = 255
             vc = _FromArgb(rv, gv, bv_c)
             for _ in range(base_vcount):
-                colors.Add(vc)
-
+                _ca(vc)
+            b += base_vcount
         mesh.Normals.ComputeNormals()
-        mesh.Compact()
         return mesh
 
     _TO_VERTS = (
@@ -439,39 +573,41 @@ class VoxelSystem(object):
     )
 
     def build_mesh_to(self, voxels, cell_w, cell_l, cell_h, color, grid_origin):
-        """Build a combined mesh of truncated octahedra (24 verts, 6 quad +
-        8 hex faces each). Hex faces are fan-triangulated into 4 tris each.
-        Total per TO: 6 quads + 32 triangles = 38 faces."""
+        """Build truncated octahedra mesh with cached method refs."""
         mesh = rg.Mesh()
-        verts = mesh.Vertices
-        faces = mesh.Faces
-        colors = mesh.VertexColors
+        _va = mesh.Vertices.Add
+        _fa = mesh.Faces.AddFace
+        _ca = mesh.VertexColors.Add
         ox0 = grid_origin.X; oy0 = grid_origin.Y; oz0 = grid_origin.Z
         cr = color.R; cg = color.G; cb = color.B
         _FromArgb = System.Drawing.Color.FromArgb
+        _int = int
 
         sw = cell_w * 0.25; sl = cell_l * 0.25; sh = cell_h * 0.25
         hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
-        to_verts = self._TO_VERTS
         to_quads = self._TO_QUADS
         to_hexes = self._TO_HEXES
+        scaled = tuple((vx * sw, vy * sl, vz * sh)
+                        for (vx, vy, vz) in self._TO_VERTS)
+        to_hex_flat = []
+        for hex_f in to_hexes:
+            v0 = hex_f[0]
+            for ti in range(1, 5):
+                to_hex_flat.append((v0, hex_f[ti], hex_f[ti + 1]))
+        to_hex_flat = tuple(to_hex_flat)
 
-        scaled = tuple((vx * sw, vy * sl, vz * sh) for (vx, vy, vz) in to_verts)
-
+        b = 0
         for (fx, fy, fz, val) in voxels:
             cx = ox0 + fx * cell_w + hw
             cy = oy0 + fy * cell_l + hl
             cz = oz0 + fz * cell_h + hh
-            b = verts.Count
             for (dx, dy, dz) in scaled:
-                verts.Add(cx + dx, cy + dy, cz + dz)
+                _va(cx + dx, cy + dy, cz + dz)
             for (a, b2, c, d) in to_quads:
-                faces.AddFace(b + a, b + b2, b + c, b + d)
-            for hex_f in to_hexes:
-                v0 = hex_f[0]
-                for ti in range(1, 5):
-                    faces.AddFace(b + v0, b + hex_f[ti], b + hex_f[ti + 1])
-            rv = int(cr * val); gv = int(cg * val); bv_c = int(cb * val)
+                _fa(b + a, b + b2, b + c, b + d)
+            for (ha, hb, hc) in to_hex_flat:
+                _fa(b + ha, b + hb, b + hc)
+            rv = _int(cr * val); gv = _int(cg * val); bv_c = _int(cb * val)
             if rv < 30: rv = 30
             elif rv > 255: rv = 255
             if gv < 30: gv = 30
@@ -479,69 +615,76 @@ class VoxelSystem(object):
             if bv_c < 30: bv_c = 30
             elif bv_c > 255: bv_c = 255
             vc = _FromArgb(rv, gv, bv_c)
-            for _ in range(24):
-                colors.Add(vc)
-
+            _ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc)
+            _ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc)
+            _ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc)
+            _ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc);_ca(vc)
+            b += 24
         mesh.Normals.ComputeNormals()
-        mesh.Compact()
         return mesh
 
     def _build_to_edge_mesh(self, voxels, cell_w, cell_l, cell_h, grid_origin):
-        """Build a degenerate-triangle mesh containing only the 36 true edges
-        of the truncated octahedron, excluding internal triangulation lines."""
+        """Build degenerate-triangle edge mesh with cached method refs."""
         em = rg.Mesh()
-        verts = em.Vertices
-        faces = em.Faces
+        _va = em.Vertices.Add
+        _fa = em.Faces.AddFace
         ox0 = grid_origin.X; oy0 = grid_origin.Y; oz0 = grid_origin.Z
         sw = cell_w * 0.25; sl = cell_l * 0.25; sh = cell_h * 0.25
         hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
         scaled = tuple((vx * sw, vy * sl, vz * sh)
                         for (vx, vy, vz) in self._TO_VERTS)
         to_edges = self._TO_EDGES
+        b = 0
         for (fx, fy, fz, val) in voxels:
             cx = ox0 + fx * cell_w + hw
             cy = oy0 + fy * cell_l + hl
             cz = oz0 + fz * cell_h + hh
             for (ei, ej) in to_edges:
-                b = verts.Count
                 dx0, dy0, dz0 = scaled[ei]
                 dx1, dy1, dz1 = scaled[ej]
-                verts.Add(cx + dx0, cy + dy0, cz + dz0)
-                verts.Add(cx + dx1, cy + dy1, cz + dz1)
-                verts.Add(cx + dx1, cy + dy1, cz + dz1)
-                faces.AddFace(b, b + 1, b + 2)
+                _va(cx + dx0, cy + dy0, cz + dz0)
+                _va(cx + dx1, cy + dy1, cz + dz1)
+                _va(cx + dx1, cy + dy1, cz + dz1)
+                _fa(b, b + 1, b + 2)
+                b += 3
         return em
 
     def build_mesh(self, voxels, cell_w, cell_l, cell_h, color, grid_origin):
-        """Build a combined mesh of axis-aligned boxes (8 verts, 6 quad faces each).
-        Vertex colours encode density (darker = lower val)."""
+        """Build combined box mesh. All method refs cached as locals to
+        eliminate attribute lookup overhead in the tight loop."""
         mesh = rg.Mesh()
-        verts = mesh.Vertices
-        faces = mesh.Faces
-        colors = mesh.VertexColors
+        _va = mesh.Vertices.Add
+        _fa = mesh.Faces.AddFace
+        _ca = mesh.VertexColors.Add
         ox0 = grid_origin.X; oy0 = grid_origin.Y; oz0 = grid_origin.Z
         cr = color.R; cg = color.G; cb = color.B
         _FromArgb = System.Drawing.Color.FromArgb
+        _int = int
 
         hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
-        default_offsets = (
-            (-hw, -hl, -hh), ( hw, -hl, -hh), ( hw,  hl, -hh), (-hw,  hl, -hh),
-            (-hw, -hl,  hh), ( hw, -hl,  hh), ( hw,  hl,  hh), (-hw,  hl,  hh))
+        o = ((-hw, -hl, -hh), ( hw, -hl, -hh), ( hw,  hl, -hh), (-hw,  hl, -hh),
+             (-hw, -hl,  hh), ( hw, -hl,  hh), ( hw,  hl,  hh), (-hw,  hl,  hh))
 
+        b = 0
         for (fx, fy, fz, val) in voxels:
             cx = ox0 + fx * cell_w + hw
             cy = oy0 + fy * cell_l + hl
             cz = oz0 + fz * cell_h + hh
-            b = verts.Count
-            for (dx, dy, dz) in default_offsets:
-                verts.Add(cx + dx, cy + dy, cz + dz)
-            faces.AddFace(b, b+1, b+2, b+3)
-            faces.AddFace(b+4, b+7, b+6, b+5)
-            faces.AddFace(b, b+4, b+5, b+1)
-            faces.AddFace(b+2, b+6, b+7, b+3)
-            faces.AddFace(b, b+3, b+7, b+4)
-            faces.AddFace(b+1, b+5, b+6, b+2)
-            rv = int(cr * val); gv = int(cg * val); bv_c = int(cb * val)
+            _va(cx+o[0][0], cy+o[0][1], cz+o[0][2])
+            _va(cx+o[1][0], cy+o[1][1], cz+o[1][2])
+            _va(cx+o[2][0], cy+o[2][1], cz+o[2][2])
+            _va(cx+o[3][0], cy+o[3][1], cz+o[3][2])
+            _va(cx+o[4][0], cy+o[4][1], cz+o[4][2])
+            _va(cx+o[5][0], cy+o[5][1], cz+o[5][2])
+            _va(cx+o[6][0], cy+o[6][1], cz+o[6][2])
+            _va(cx+o[7][0], cy+o[7][1], cz+o[7][2])
+            _fa(b, b+1, b+2, b+3)
+            _fa(b+4, b+7, b+6, b+5)
+            _fa(b, b+4, b+5, b+1)
+            _fa(b+2, b+6, b+7, b+3)
+            _fa(b, b+3, b+7, b+4)
+            _fa(b+1, b+5, b+6, b+2)
+            rv = _int(cr * val); gv = _int(cg * val); bv_c = _int(cb * val)
             if rv < 30: rv = 30
             elif rv > 255: rv = 255
             if gv < 30: gv = 30
@@ -549,10 +692,10 @@ class VoxelSystem(object):
             if bv_c < 30: bv_c = 30
             elif bv_c > 255: bv_c = 255
             vc = _FromArgb(rv, gv, bv_c)
-            for _ in range(8):
-                colors.Add(vc)
+            _ca(vc);_ca(vc);_ca(vc);_ca(vc)
+            _ca(vc);_ca(vc);_ca(vc);_ca(vc)
+            b += 8
         mesh.Normals.ComputeNormals()
-        mesh.Compact()
         return mesh
 
     def _extract_feature_edges(self, mesh, angle_deg=20.0):
@@ -578,33 +721,32 @@ class VoxelSystem(object):
 
     def _build_edge_mesh(self, voxels, cell_w, cell_l, cell_h, grid_origin,
                          custom_scale):
-        """Create a degenerate-triangle mesh from feature edge lines so they can
-        be drawn as wireframe via DrawMeshWires for custom geometry voxels."""
+        """Build custom edge mesh with cached method refs and pre-extracted
+        edge endpoint coordinates."""
         if not self.custom_base_edges:
             return None
         em = rg.Mesh()
-        verts = em.Vertices
-        faces = em.Faces
-        ox0 = grid_origin.X
-        oy0 = grid_origin.Y
-        oz0 = grid_origin.Z
+        _va = em.Vertices.Add
+        _fa = em.Faces.AddFace
+        ox0 = grid_origin.X; oy0 = grid_origin.Y; oz0 = grid_origin.Z
         sx = cell_w * custom_scale
         sy = cell_l * custom_scale
         sz = cell_h * custom_scale
-
+        hw = cell_w * 0.5; hl = cell_l * 0.5; hh = cell_h * 0.5
+        edge_data = tuple(
+            (be.From.X, be.From.Y, be.From.Z, be.To.X, be.To.Y, be.To.Z)
+            for be in self.custom_base_edges)
+        b = 0
         for (ix, iy, iz, val) in voxels:
-            cx = ox0 + ix * cell_w + cell_w * 0.5
-            cy = oy0 + iy * cell_l + cell_l * 0.5
-            cz = oz0 + iz * cell_h + cell_h * 0.5
-
-            for be in self.custom_base_edges:
-                fr = be.From
-                to = be.To
-                b = verts.Count
-                verts.Add(fr.X * sx + cx, fr.Y * sy + cy, fr.Z * sz + cz)
-                verts.Add(to.X * sx + cx, to.Y * sy + cy, to.Z * sz + cz)
-                verts.Add(to.X * sx + cx, to.Y * sy + cy, to.Z * sz + cz)
-                faces.AddFace(b, b + 1, b + 2)
+            cx = ox0 + ix * cell_w + hw
+            cy = oy0 + iy * cell_l + hl
+            cz = oz0 + iz * cell_h + hh
+            for (fx, fy, fz, tx, ty, tz) in edge_data:
+                _va(fx * sx + cx, fy * sy + cy, fz * sz + cz)
+                _va(tx * sx + cx, ty * sy + cy, tz * sz + cz)
+                _va(tx * sx + cx, ty * sy + cy, tz * sz + cz)
+                _fa(b, b + 1, b + 2)
+                b += 3
         return em
 
     def update_display(self, voxels, cell_w, cell_l, cell_h, color,
@@ -733,12 +875,33 @@ def _closest_dist_static(pt, geo):
     return float('inf')
 
 
+def _closest_point_on_geo(geo, pt):
+    """Return the closest Point3d on geo to pt, or None on failure."""
+    try:
+        if isinstance(geo, rg.Curve):
+            rc, t = geo.ClosestPoint(pt)
+            if rc:
+                return geo.PointAt(t)
+        elif isinstance(geo, rg.Mesh):
+            return geo.ClosestPoint(pt)
+        elif isinstance(geo, rg.Brep):
+            return geo.ClosestPoint(pt)
+        elif isinstance(geo, rg.Surface):
+            rc, u, v = geo.ClosestPoint(pt)
+            if rc:
+                return geo.PointAt(u, v)
+    except:
+        pass
+    return None
+
+
 class VoxelPathfinder(object):
     def __init__(self):
         self.graph = {}
         self.node_positions = {}
         self.node_density = {}
         self.trails = []
+        self.trail_keys = []
         self.start_points = []
         self.target_points = []
         self.target_curves = []
@@ -881,26 +1044,75 @@ class VoxelPathfinder(object):
 
     # -- Random start generation --------------------------------------------
     def generate_random_starts(self, count, seed):
-        """Pick random graph nodes biased toward high density."""
+        """Pick random graph nodes evenly distributed across the volume.
+
+        Uses stratified sampling: divides the bounding box into a grid of
+        cells and picks one random node per cell, cycling through cells
+        until count is reached. This prevents clustering on one side.
+        """
         random.seed(seed)
         if not self.graph:
             self.start_points = []
             return
         nodes = list(self.graph.keys())
-        sorted_nodes = sorted(
-            nodes, key=lambda k: self.node_density.get(k, 0), reverse=True)
-        pool = sorted_nodes[:max(1, len(sorted_nodes) // 3)]
+        if not nodes:
+            self.start_points = []
+            return
+        positions = self.node_positions
+
+        xs = [positions[k].X for k in nodes]
+        ys = [positions[k].Y for k in nodes]
+        zs = [positions[k].Z for k in nodes]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        z_min, z_max = min(zs), max(zs)
+
+        n_div = max(2, int(round(count ** (1.0 / 3.0))))
+        dx = (x_max - x_min + 0.001) / n_div
+        dy = (y_max - y_min + 0.001) / n_div
+        dz = (z_max - z_min + 0.001) / n_div
+
+        buckets = {}
+        for k in nodes:
+            p = positions[k]
+            bx = int((p.X - x_min) / dx)
+            by = int((p.Y - y_min) / dy)
+            bz = int((p.Z - z_min) / dz)
+            cell = (bx, by, bz)
+            if cell not in buckets:
+                buckets[cell] = []
+            buckets[cell].append(k)
+
+        cells = list(buckets.keys())
+        random.shuffle(cells)
+
         self.start_points = []
-        for _ in range(min(count, len(pool))):
-            k = pool[random.randint(0, len(pool) - 1)]
-            self.start_points.append(self.node_positions[k])
+        idx = 0
+        while len(self.start_points) < count and cells:
+            cell = cells[idx % len(cells)]
+            pool = buckets[cell]
+            pick = pool[random.randint(0, len(pool) - 1)]
+            self.start_points.append(positions[pick])
+            idx += 1
+            if idx >= len(cells):
+                random.shuffle(cells)
+                idx = 0
 
     # -- Attractor distance helper ------------------------------------------
-    def _attractor_score(self, nb_pos, curr_pos, attr_strength, attr_radius):
-        """Compute attractor pull score for a candidate neighbour."""
-        if attr_strength <= 0:
+    def _attractor_score(self, nb_pos, curr_pos, attr_strength, attr_radius,
+                         repulsion_radius):
+        """Compute attractor pull and repulsion score for a candidate neighbour.
+
+        Within attr_radius the neighbour is pulled toward attractors.
+        Within repulsion_radius the neighbour is strongly pushed away,
+        keeping paths from intersecting with the attractor geometry.
+        Repulsion is independent of attr_strength and uses a quadratic
+        falloff so it dominates all other forces at close range.
+        """
+        if attr_strength <= 0 and repulsion_radius <= 0:
             return 0.0
         score = 0.0
+        min_dist = float('inf')
 
         if self.target_points:
             best_d = float('inf')
@@ -910,9 +1122,11 @@ class VoxelPathfinder(object):
                 if d < best_d:
                     best_d = d
                     best_pt = tp
-            if best_d < attr_radius:
+            if best_d < min_dist:
+                min_dist = best_d
+            if attr_strength > 0 and best_d < attr_radius:
                 score += attr_strength * (1.0 - best_d / attr_radius)
-            if best_pt is not None:
+            if best_pt is not None and attr_strength > 0:
                 dx_t = best_pt.X - curr_pos.X
                 dy_t = best_pt.Y - curr_pos.Y
                 dz_t = best_pt.Z - curr_pos.Z
@@ -928,28 +1142,51 @@ class VoxelPathfinder(object):
         all_geos = list(self.target_curves) + list(self.target_geos)
         if all_geos:
             best_d = float('inf')
+            best_geo = None
             for geo in all_geos:
                 d = _closest_dist_static(nb_pos, geo)
                 if d < best_d:
                     best_d = d
-            if best_d < attr_radius:
+                    best_geo = geo
+            if best_d < min_dist:
+                min_dist = best_d
+            if attr_strength > 0 and best_d < attr_radius:
                 score += attr_strength * (1.0 - best_d / attr_radius)
+            if best_geo is not None and attr_strength > 0:
+                cp = _closest_point_on_geo(best_geo, curr_pos)
+                if cp is not None:
+                    dx_t = cp.X - curr_pos.X
+                    dy_t = cp.Y - curr_pos.Y
+                    dz_t = cp.Z - curr_pos.Z
+                    dx_n = nb_pos.X - curr_pos.X
+                    dy_n = nb_pos.Y - curr_pos.Y
+                    dz_n = nb_pos.Z - curr_pos.Z
+                    ln_t = math.sqrt(dx_t*dx_t + dy_t*dy_t + dz_t*dz_t)
+                    ln_n = math.sqrt(dx_n*dx_n + dy_n*dy_n + dz_n*dz_n)
+                    if ln_t > 1e-9 and ln_n > 1e-9:
+                        dot = (dx_t*dx_n + dy_t*dy_n + dz_t*dz_n) / (ln_t * ln_n)
+                        score += dot * attr_strength * 0.5
+
+        if repulsion_radius > 0 and min_dist < repulsion_radius:
+            ratio = 1.0 - min_dist / repulsion_radius
+            score -= 100.0 * ratio * ratio
 
         return score
 
     # -- Pathfinding --------------------------------------------------------
     def find_paths(self, max_steps, branch_prob, max_branches,
                    density_strength, attractor_strength, attractor_radius,
-                   momentum_strength, separation_strength,
+                   repulsion_radius, momentum_strength, separation_strength,
                    wander_strength, seed):
         """Run scored greedy walks from each start point through the graph.
 
         At every step each agent scores its neighbours by:
-          density pull    -- prefer high-density nodes
-          attractor pull  -- pull toward assigned target pts/curves/geos
-          momentum        -- prefer continuing in the same direction
-          separation      -- penalise previously visited nodes
-          wander          -- random noise for organic variation
+          density pull     -- prefer high-density nodes
+          attractor pull   -- pull toward assigned target pts/curves/geos
+          repulsion field  -- push away within repulsion_radius of targets
+          momentum         -- prefer continuing in the same direction
+          separation       -- penalise previously visited nodes
+          wander           -- random noise for organic variation
 
         Returns list of trails (each trail is a list of Point3d).
         """
@@ -997,7 +1234,8 @@ class VoxelPathfinder(object):
                     nb_pos = positions[nb]
 
                     score += self._attractor_score(
-                        nb_pos, curr_pos, attractor_strength, attractor_radius)
+                        nb_pos, curr_pos, attractor_strength, attractor_radius,
+                        repulsion_radius)
 
                     if agent['prev'] is not None and momentum_strength > 0:
                         prev_pos = positions[agent['prev']]
@@ -1042,10 +1280,235 @@ class VoxelPathfinder(object):
                 break
 
         self.trails = []
+        self.trail_keys = []
         for agent in agents:
             if len(agent['trail']) > 1:
                 pts = [positions[k] for k in agent['trail']]
                 self.trails.append(pts)
+                self.trail_keys.append(list(agent['trail']))
+
+        return self.trails
+
+    # -- Slime Mould mode ---------------------------------------------------
+    def _collect_anchors(self):
+        """Gather world-space anchor points from all target geometry.
+
+        Points are used directly. Curves contribute their midpoint.
+        Meshes/breps/surfaces contribute their bounding-box centre.
+        Each anchor is snapped to the nearest graph node.
+        Returns list of (graph_key, Point3d) tuples.
+        """
+        raw = []
+        for pt in self.target_points:
+            raw.append(pt)
+        for crv in self.target_curves:
+            t = crv.Domain.Mid
+            raw.append(crv.PointAt(t))
+        for geo in self.target_geos:
+            bb = geo.GetBoundingBox(False)
+            if bb.IsValid:
+                raw.append(bb.Center)
+        anchors = []
+        seen = set()
+        for pt in raw:
+            k = self._snap_to_nearest(pt)
+            if k is not None and k not in seen:
+                seen.add(k)
+                anchors.append((k, self.node_positions[k]))
+        return anchors
+
+    def _min_dist_to_targets(self, pt):
+        """Shortest distance from pt to any assigned target geometry."""
+        min_d = float('inf')
+        for tp in self.target_points:
+            d = pt.DistanceTo(tp)
+            if d < min_d:
+                min_d = d
+        for crv in self.target_curves:
+            d = _closest_dist_static(pt, crv)
+            if d < min_d:
+                min_d = d
+        for geo in self.target_geos:
+            d = _closest_dist_static(pt, geo)
+            if d < min_d:
+                min_d = d
+        return min_d
+
+    def find_slime_paths(self, max_steps, density_strength,
+                         momentum_strength, separation_strength,
+                         wander_strength, repulsion_radius,
+                         mould_density, reinforcement,
+                         direction_strength, branch_prob,
+                         max_branches, seed):
+        """Simulate Physarum-style slime mould growth.
+
+        Growth happens in waves. Each wave spawns agents from all anchor
+        nodes AND from high-traffic nodes in the existing network, letting
+        the mould expand outward and fill the volume over multiple
+        iterations.
+
+        mould_density:      agents per anchor per wave (1-500)
+        reinforcement:      bonus for already-visited nodes (tube thickening)
+        direction_strength: how strongly agents aim at their target (0=wander, 3=direct)
+        branch_prob:        chance of branching per step
+        max_branches:       cap on total branch agents
+        """
+        random.seed(seed)
+        self.trails = []
+        anchors = self._collect_anchors()
+        if len(anchors) < 2:
+            return []
+
+        positions = self.node_positions
+        graph = self.graph
+        dens = self.node_density
+        n = len(anchors)
+
+        anchor_keys = set(a[0] for a in anchors)
+        anchor_positions = [a[1] for a in anchors]
+
+        visit_counts = {}
+        total_branches = 0
+
+        spawn_keys = [a[0] for a in anchors]
+
+        agents = []
+        for src_idx in range(n):
+            src_key = anchors[src_idx][0]
+            src_pos = anchors[src_idx][1]
+            other_dists = []
+            for j in range(n):
+                if j == src_idx:
+                    continue
+                other_dists.append(
+                    (src_pos.DistanceTo(anchor_positions[j]), j))
+            if not other_dists:
+                continue
+            avg_d = sum(od[0] for od in other_dists) / len(other_dists)
+
+            for _ in range(mould_density):
+                best_d = float('inf')
+                tgt_idx = -1
+                for (base_d, j) in other_dists:
+                    d = base_d + random.random() * avg_d * 0.4
+                    if d < best_d:
+                        best_d = d
+                        tgt_idx = j
+                if tgt_idx < 0:
+                    continue
+                agents.append({
+                    'pos': src_key,
+                    'target': anchor_positions[tgt_idx],
+                    'target_key': anchors[tgt_idx][0],
+                    'trail': [src_key],
+                    'prev': None,
+                    'alive': True
+                })
+
+        for step in range(max_steps):
+            new_agents = []
+            any_alive = False
+            for agent in agents:
+                if not agent['alive']:
+                    continue
+                any_alive = True
+                current = agent['pos']
+                target_pos = agent['target']
+
+                if current == agent['target_key']:
+                    agent['alive'] = False
+                    continue
+                if (current in anchor_keys and current != agent['trail'][0]
+                        and len(agent['trail']) > 3):
+                    agent['alive'] = False
+                    continue
+
+                neighbors = list(graph.get(current, set()))
+                if not neighbors:
+                    agent['alive'] = False
+                    continue
+
+                curr_pos = positions[current]
+                scores = []
+                for nb in neighbors:
+                    nb_pos = positions[nb]
+                    score = dens.get(nb, 0) * density_strength
+
+                    if direction_strength > 0:
+                        dx_t = target_pos.X - curr_pos.X
+                        dy_t = target_pos.Y - curr_pos.Y
+                        dz_t = target_pos.Z - curr_pos.Z
+                        dx_n = nb_pos.X - curr_pos.X
+                        dy_n = nb_pos.Y - curr_pos.Y
+                        dz_n = nb_pos.Z - curr_pos.Z
+                        ln_t = math.sqrt(dx_t*dx_t + dy_t*dy_t + dz_t*dz_t)
+                        ln_n = math.sqrt(dx_n*dx_n + dy_n*dy_n + dz_n*dz_n)
+                        if ln_t > 1e-9 and ln_n > 1e-9:
+                            dot = (dx_t*dx_n + dy_t*dy_n + dz_t*dz_n)
+                            score += (dot / (ln_t * ln_n)) * direction_strength
+                        dist_nb = nb_pos.DistanceTo(target_pos)
+                        score += direction_strength * 0.5 / (dist_nb + 0.01)
+
+                    if repulsion_radius > 0:
+                        min_d = self._min_dist_to_targets(nb_pos)
+                        if min_d < repulsion_radius:
+                            d_cur = curr_pos.DistanceTo(target_pos)
+                            if d_cur > repulsion_radius * 1.5:
+                                ratio = 1.0 - min_d / repulsion_radius
+                                score -= 100.0 * ratio * ratio
+
+                    if agent['prev'] is not None and momentum_strength > 0:
+                        prev_pos = positions[agent['prev']]
+                        dx0 = curr_pos.X - prev_pos.X
+                        dy0 = curr_pos.Y - prev_pos.Y
+                        dz0 = curr_pos.Z - prev_pos.Z
+                        dx1 = nb_pos.X - curr_pos.X
+                        dy1 = nb_pos.Y - curr_pos.Y
+                        dz1 = nb_pos.Z - curr_pos.Z
+                        score += (dx0*dx1 + dy0*dy1 + dz0*dz1) * momentum_strength
+
+                    vc = visit_counts.get(nb, 0)
+                    if vc > 0:
+                        score += vc * reinforcement
+                        score -= vc * separation_strength
+
+                    score += random.random() * wander_strength
+                    scores.append((score, nb))
+
+                scores.sort(key=lambda x: x[0], reverse=True)
+                chosen = scores[0][1]
+
+                agent['prev'] = current
+                agent['pos'] = chosen
+                agent['trail'].append(chosen)
+                visit_counts[chosen] = visit_counts.get(chosen, 0) + 1
+
+                if (branch_prob > 0 and total_branches < max_branches
+                        and len(scores) > 1
+                        and random.random() < branch_prob):
+                    br_key = scores[1][1]
+                    br_tgt_idx = random.randint(0, n - 1)
+                    new_agents.append({
+                        'pos': br_key,
+                        'target': anchor_positions[br_tgt_idx],
+                        'target_key': anchors[br_tgt_idx][0],
+                        'trail': [current, br_key],
+                        'prev': current,
+                        'alive': True
+                    })
+                    total_branches += 1
+
+            agents.extend(new_agents)
+            if not any_alive:
+                break
+
+        self.trails = []
+        self.trail_keys = []
+        for agent in agents:
+            if len(agent['trail']) > 1:
+                pts = [positions[k] for k in agent['trail']]
+                self.trails.append(pts)
+                self.trail_keys.append(list(agent['trail']))
 
         return self.trails
 
@@ -1061,15 +1524,12 @@ class VoxelDialog(forms.Form):
     def __init__(self):
         super(VoxelDialog, self).__init__()
         self.Title = "Voxel Field Tool v01"
-        self.Padding = drawing.Padding(8)
+        self.Padding = drawing.Padding(6)
         self.Resizable = True
-        self.MinimumSize = drawing.Size(370, 700)
+        self.MinimumSize = drawing.Size(420, 700)
+        self.Size = drawing.Size(420, 800)
 
         self.system = VoxelSystem()
-        self.attractor_pts = []
-        self.attractor_curves = []
-        self.attractor_geos = []
-        self.base_geometries = []
         self.bounds_geometries = []
         self.bounds_meshes = []
         self.bounds_aabb = None
@@ -1083,20 +1543,40 @@ class VoxelDialog(forms.Form):
         self._compute_dirty = False
         self._display_dirty = False
 
+        self._anim_wander_trails = []
+        self._anim_wander_points = []
+        self._anim_wander_frame = 0
+        self._anim_wander_max_frame = 0
+        self._anim_wander_playing = False
+
+        self._anim_slime_trails = []
+        self._anim_slime_points = []
+        self._anim_slime_frame = 0
+        self._anim_slime_max_frame = 0
+        self._anim_slime_playing = False
+
         self._build_ui()
 
         self._timer = forms.UITimer()
-        self._timer.Interval = 0.12
+        self._timer.Interval = 0.06
         self._timer.Elapsed += self._on_timer_tick
         self._timer.Start()
+
+        self._anim_wander_timer = forms.UITimer()
+        self._anim_wander_timer.Interval = 0.05
+        self._anim_wander_timer.Elapsed += self._on_anim_wander_tick
+
+        self._anim_slime_timer = forms.UITimer()
+        self._anim_slime_timer.Interval = 0.05
+        self._anim_slime_timer.Elapsed += self._on_anim_slime_tick
 
         self._full_regenerate()
 
     # -- UI ----------------------------------------------------------------
     def _build_ui(self):
         layout = forms.DynamicLayout()
-        layout.DefaultSpacing = drawing.Size(4, 4)
-        layout.DefaultPadding = drawing.Padding(6)
+        layout.DefaultSpacing = drawing.Size(4, 2)
+        layout.DefaultPadding = drawing.Padding(4)
 
         self.chk_live = forms.CheckBox()
         self.chk_live.Text = "Live Update"
@@ -1106,11 +1586,7 @@ class VoxelDialog(forms.Form):
         self._link_guard = False
 
         # -- bounding geometry (first section) -----------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Bounding Geometry")
-        exp.Expanded = True
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
+        inner, _sec_finish = self._section(layout, "Bounding Geometry", True)
 
         btn_pick_bounds = forms.Button()
         btn_pick_bounds.Text = "Assign Bounds"
@@ -1140,69 +1616,23 @@ class VoxelDialog(forms.Form):
         lbl_clip.Text = "Clip Mode"
         lbl_clip.Width = 105
         self.dd_clip_mode = forms.DropDown()
+        self.dd_clip_mode.Width = 150
         self.dd_clip_mode.Items.Add("Center Point")
         self.dd_clip_mode.Items.Add("All Corners")
         self.dd_clip_mode.SelectedIndex = 0
         self.dd_clip_mode.SelectedIndexChanged += lambda s, e: self._mark_compute()
         inner.AddRow(lbl_clip, self.dd_clip_mode)
 
-        exp.Content = inner
-        layout.AddRow(exp)
-
-        # -- geometry input ------------------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Geometry Input")
-        exp.Expanded = False
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
-
-        btn_pick_base = forms.Button()
-        btn_pick_base.Text = "Assign Base Geometry"
-        btn_pick_base.Click += self._on_pick_base
-        btn_clr_base = forms.Button()
-        btn_clr_base.Text = "Clear Base"
-        btn_clr_base.Click += self._on_clear_base
-        inner.AddRow(btn_pick_base, btn_clr_base)
-
-        self.lbl_base = forms.Label()
-        self.lbl_base.Text = "Base: None"
-        inner.AddRow(self.lbl_base)
-
-        self.chk_use_base = forms.CheckBox()
-        self.chk_use_base.Text = "Use Base Geometry"
-        self.chk_use_base.Checked = False
-        self.chk_use_base.CheckedChanged += lambda s, e: self._mark_compute()
-        inner.AddRow(self.chk_use_base)
-
-        self.chk_auto_center = forms.CheckBox()
-        self.chk_auto_center.Text = "Auto-Center Grid on Base"
-        self.chk_auto_center.Checked = True
-        self.chk_auto_center.CheckedChanged += lambda s, e: self._mark_compute()
-        inner.AddRow(self.chk_auto_center)
-
-        self.chk_carve = forms.CheckBox()
-        self.chk_carve.Text = "Carve Mode (invert base effect)"
-        self.chk_carve.Checked = False
-        self.chk_carve.CheckedChanged += lambda s, e: self._mark_compute()
-        inner.AddRow(self.chk_carve)
-
-        self.sld_base_r, self.txt_base_r = self._float_slider(inner, "Base Radius", 1.0, 80.0, 20.0, self._mark_compute)
-        self.sld_base_s, self.txt_base_s = self._float_slider(inner, "Base Strength", 0.0, 1.0, 0.6, self._mark_compute)
-
-        exp.Content = inner
-        layout.AddRow(exp)
+        _sec_finish()
 
         # -- grid dimensions -----------------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Grid Dimensions")
-        exp.Expanded = True
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
+        inner, _sec_finish = self._section(layout, "Grid Dimensions", True)
 
         lbl_gt = forms.Label()
         lbl_gt.Text = "Grid Type"
         lbl_gt.Width = 105
         self.dd_grid_type = forms.DropDown()
+        self.dd_grid_type.Width = 150
         self.dd_grid_type.Items.Add("Cube")
         self.dd_grid_type.Items.Add("Truncated Octahedron")
         self.dd_grid_type.SelectedIndex = 0
@@ -1277,90 +1707,10 @@ class VoxelDialog(forms.Form):
         self.sld_cl.ValueChanged += _sync_voxel_l
         self.sld_ch.ValueChanged += _sync_voxel_h
 
-        exp.Content = inner
-        layout.AddRow(exp)
-
-        # -- noise parameters ----------------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Noise Parameters")
-        exp.Expanded = True
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
-
-        self.chk_fill_grid = forms.CheckBox()
-        self.chk_fill_grid.Text = "Fill Grid (bypass noise)"
-        self.chk_fill_grid.Checked = False
-        self.chk_fill_grid.CheckedChanged += lambda s, e: self._mark_compute()
-        inner.AddRow(self.chk_fill_grid)
-
-        self.sld_scale, self.txt_scale = self._float_slider(inner, "Noise Scale", 0.01, 1.0, 0.15, self._mark_compute)
-        self.sld_thresh, self.txt_thresh = self._float_slider(inner, "Threshold", 0.0, 1.0, 0.45, self._mark_compute)
-        self.sld_oct, self.txt_oct = self._int_slider(inner, "Octaves", 1, 6, 3, self._mark_compute)
-        self.sld_seed, self.txt_seed = self._int_slider(inner, "Seed", 0, 100, 0, self._mark_compute)
-
-        exp.Content = inner
-        layout.AddRow(exp)
-
-        # -- attractor -----------------------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Attractor")
-        exp.Expanded = False
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
-
-        self.chk_attr = forms.CheckBox()
-        self.chk_attr.Text = "Use Attractors"
-        self.chk_attr.Checked = False
-        self.chk_attr.CheckedChanged += lambda s, e: self._mark_compute()
-        inner.AddRow(self.chk_attr)
-        self.sld_attr_r, self.txt_attr_r = self._float_slider(inner, "Attr Radius", 1.0, 50.0, 15.0, self._mark_compute)
-        self.sld_attr_s, self.txt_attr_s = self._float_slider(inner, "Attr Strength", 0.0, 1.0, 0.5, self._mark_compute)
-
-        btn_pick = forms.Button()
-        btn_pick.Text = "Assign Attr Pts"
-        btn_pick.Click += self._on_pick_attractors
-        btn_clr_attr = forms.Button()
-        btn_clr_attr.Text = "Clear Pts"
-        btn_clr_attr.Click += self._on_clear_attractors
-        inner.AddRow(btn_pick, btn_clr_attr)
-
-        self.lbl_attr_count = forms.Label()
-        self.lbl_attr_count.Text = "Points: 0"
-        inner.AddRow(self.lbl_attr_count)
-
-        btn_pick_crv = forms.Button()
-        btn_pick_crv.Text = "Assign Attr Curves"
-        btn_pick_crv.Click += self._on_pick_attractor_curves
-        btn_clr_crv = forms.Button()
-        btn_clr_crv.Text = "Clear Curves"
-        btn_clr_crv.Click += self._on_clear_attractor_curves
-        inner.AddRow(btn_pick_crv, btn_clr_crv)
-
-        self.lbl_attr_crv_count = forms.Label()
-        self.lbl_attr_crv_count.Text = "Curves: 0"
-        inner.AddRow(self.lbl_attr_crv_count)
-
-        btn_pick_geo = forms.Button()
-        btn_pick_geo.Text = "Assign Attr Geos"
-        btn_pick_geo.Click += self._on_pick_attractor_geos
-        btn_clr_geo = forms.Button()
-        btn_clr_geo.Text = "Clear Geos"
-        btn_clr_geo.Click += self._on_clear_attractor_geos
-        inner.AddRow(btn_pick_geo, btn_clr_geo)
-
-        self.lbl_attr_geo_count = forms.Label()
-        self.lbl_attr_geo_count.Text = "Geometries: 0"
-        inner.AddRow(self.lbl_attr_geo_count)
-
-        exp.Content = inner
-        layout.AddRow(exp)
+        _sec_finish()
 
         # -- custom voxel geometry -----------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Custom Voxel Geometry")
-        exp.Expanded = False
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
+        inner, _sec_finish = self._section(layout, "Custom Voxel Geometry", False)
 
         btn_pick_custom = forms.Button()
         btn_pick_custom.Text = "Assign Custom Geo"
@@ -1383,15 +1733,10 @@ class VoxelDialog(forms.Form):
         self.sld_custom_s, self.txt_custom_s = self._float_slider(
             inner, "Custom Scale", 0.1, 2.0, 1.0, self._mark_display)
 
-        exp.Content = inner
-        layout.AddRow(exp)
+        _sec_finish()
 
         # -- pathfinding -------------------------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Pathfinding")
-        exp.Expanded = False
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
+        inner, _sec_finish = self._section(layout, "Pathfinding", False)
 
         lbl_gm = forms.Label()
         lbl_gm.Text = "Graph Mode"
@@ -1400,150 +1745,426 @@ class VoxelDialog(forms.Form):
         self.dd_graph_mode.Items.Add("Voxel Centres")
         self.dd_graph_mode.Items.Add("Voxel Edges")
         self.dd_graph_mode.SelectedIndex = 0
+        self.dd_graph_mode.Width = 150
         inner.AddRow(lbl_gm, self.dd_graph_mode)
 
+        inner.AddRow(None)
+
         lbl_sp = forms.Label()
-        lbl_sp.Text = "-- Start Points --"
+        lbl_sp.Text = "Start Points (Wander)"
+        lbl_sp.Font = drawing.Font(lbl_sp.Font.Family, lbl_sp.Font.Size,
+                                   drawing.FontStyle.Bold)
         inner.AddRow(lbl_sp)
 
         self.sld_pf_agents, self.txt_pf_agents = self._int_slider(
             inner, "Agent Count", 1, 50, 5, self._noop)
 
         btn_pick_starts = forms.Button()
-        btn_pick_starts.Text = "Assign Start Pts"
+        btn_pick_starts.Text = "Assign"
+        btn_pick_starts.Width = 80
         btn_pick_starts.Click += self._on_pick_start_pts
         btn_clr_starts = forms.Button()
         btn_clr_starts.Text = "Clear"
+        btn_clr_starts.Width = 80
         btn_clr_starts.Click += self._on_clear_start_pts
         btn_rand_starts = forms.Button()
-        btn_rand_starts.Text = "Generate Random"
+        btn_rand_starts.Text = "Random"
+        btn_rand_starts.Width = 80
         btn_rand_starts.Click += self._on_generate_random_starts
-        inner.AddRow(btn_pick_starts, btn_clr_starts, btn_rand_starts)
-
         self.lbl_start_count = forms.Label()
-        self.lbl_start_count.Text = "Start Pts: 0"
-        inner.AddRow(self.lbl_start_count)
+        self.lbl_start_count.Text = "0"
+        self.lbl_start_count.Width = 40
+        inner.AddRow(btn_pick_starts, btn_clr_starts, btn_rand_starts,
+                     self.lbl_start_count)
+
+        inner.AddRow(None)
 
         lbl_tgt = forms.Label()
-        lbl_tgt.Text = "-- Targets --"
+        lbl_tgt.Text = "Targets (Wander attractors / Slime Mould nodes)"
+        lbl_tgt.Font = drawing.Font(lbl_tgt.Font.Family, lbl_tgt.Font.Size,
+                                    drawing.FontStyle.Bold)
         inner.AddRow(lbl_tgt)
 
         btn_pick_tgt_pts = forms.Button()
-        btn_pick_tgt_pts.Text = "Assign Target Pts"
+        btn_pick_tgt_pts.Text = "Points"
+        btn_pick_tgt_pts.Width = 80
         btn_pick_tgt_pts.Click += self._on_pick_target_pts
         btn_clr_tgt_pts = forms.Button()
         btn_clr_tgt_pts.Text = "Clear"
+        btn_clr_tgt_pts.Width = 50
         btn_clr_tgt_pts.Click += self._on_clear_target_pts
-        inner.AddRow(btn_pick_tgt_pts, btn_clr_tgt_pts)
-
         self.lbl_tgt_pt_count = forms.Label()
-        self.lbl_tgt_pt_count.Text = "Target Pts: 0"
-        inner.AddRow(self.lbl_tgt_pt_count)
+        self.lbl_tgt_pt_count.Text = "0"
+        self.lbl_tgt_pt_count.Width = 30
 
         btn_pick_tgt_crv = forms.Button()
-        btn_pick_tgt_crv.Text = "Assign Target Curves"
+        btn_pick_tgt_crv.Text = "Curves"
+        btn_pick_tgt_crv.Width = 80
         btn_pick_tgt_crv.Click += self._on_pick_target_curves
         btn_clr_tgt_crv = forms.Button()
         btn_clr_tgt_crv.Text = "Clear"
+        btn_clr_tgt_crv.Width = 50
         btn_clr_tgt_crv.Click += self._on_clear_target_curves
-        inner.AddRow(btn_pick_tgt_crv, btn_clr_tgt_crv)
-
         self.lbl_tgt_crv_count = forms.Label()
-        self.lbl_tgt_crv_count.Text = "Target Curves: 0"
-        inner.AddRow(self.lbl_tgt_crv_count)
+        self.lbl_tgt_crv_count.Text = "0"
+        self.lbl_tgt_crv_count.Width = 30
 
         btn_pick_tgt_geo = forms.Button()
-        btn_pick_tgt_geo.Text = "Assign Target Geos"
+        btn_pick_tgt_geo.Text = "Geos"
+        btn_pick_tgt_geo.Width = 80
         btn_pick_tgt_geo.Click += self._on_pick_target_geos
         btn_clr_tgt_geo = forms.Button()
         btn_clr_tgt_geo.Text = "Clear"
+        btn_clr_tgt_geo.Width = 50
         btn_clr_tgt_geo.Click += self._on_clear_target_geos
-        inner.AddRow(btn_pick_tgt_geo, btn_clr_tgt_geo)
-
         self.lbl_tgt_geo_count = forms.Label()
-        self.lbl_tgt_geo_count.Text = "Target Geos: 0"
-        inner.AddRow(self.lbl_tgt_geo_count)
+        self.lbl_tgt_geo_count.Text = "0"
+        self.lbl_tgt_geo_count.Width = 30
 
-        lbl_alg = forms.Label()
-        lbl_alg.Text = "-- Algorithm --"
-        inner.AddRow(lbl_alg)
+        inner.AddRow(btn_pick_tgt_pts, btn_clr_tgt_pts, self.lbl_tgt_pt_count)
+        inner.AddRow(btn_pick_tgt_crv, btn_clr_tgt_crv, self.lbl_tgt_crv_count)
+        inner.AddRow(btn_pick_tgt_geo, btn_clr_tgt_geo, self.lbl_tgt_geo_count)
+
+        inner.AddRow(None)
+
+        lbl_shared = forms.Label()
+        lbl_shared.Text = "Shared Parameters"
+        lbl_shared.Font = drawing.Font(lbl_shared.Font.Family,
+                                       lbl_shared.Font.Size,
+                                       drawing.FontStyle.Bold)
+        inner.AddRow(lbl_shared)
 
         self.sld_pf_steps, self.txt_pf_steps = self._int_slider(
-            inner, "Max Steps", 10, 500, 100, self._noop)
-        self.sld_pf_branch, self.txt_pf_branch = self._float_slider(
-            inner, "Branch Prob", 0.0, 0.3, 0.05, self._noop)
-        self.sld_pf_max_br, self.txt_pf_max_br = self._int_slider(
-            inner, "Max Branches", 0, 200, 50, self._noop)
+            inner, "Max Steps", 10, 1000, 200, self._noop)
         self.sld_pf_density, self.txt_pf_density = self._float_slider(
             inner, "Density Pull", 0.0, 2.0, 1.0, self._noop)
+        self.sld_pf_momentum, self.txt_pf_momentum = self._float_slider(
+            inner, "Momentum", 0.0, 2.0, 0.8, self._noop)
+        self.sld_pf_sep, self.txt_pf_sep = self._float_slider(
+            inner, "Separation", 0.0, 2.0, 0.3, self._noop)
+        self.sld_pf_wander, self.txt_pf_wander = self._float_slider(
+            inner, "Wander", 0.0, 2.0, 0.3, self._noop)
+        self.sld_pf_repulse, self.txt_pf_repulse = self._float_slider(
+            inner, "Repulsion Dist", 0.0, 50.0, 0.0, self._noop)
+        self.sld_pf_branch, self.txt_pf_branch = self._float_slider(
+            inner, "Branch Prob", 0.0, 0.5, 0.05, self._noop)
+        self.sld_pf_max_br, self.txt_pf_max_br = self._int_slider(
+            inner, "Max Branches", 0, 500, 50, self._noop)
+        self.sld_pf_seed, self.txt_pf_seed = self._int_slider(
+            inner, "Seed", 0, 100, 42, self._noop)
+
+        inner.AddRow(None)
+
+        lbl_w = forms.Label()
+        lbl_w.Text = "Wander Only"
+        lbl_w.Font = drawing.Font(lbl_w.Font.Family, lbl_w.Font.Size,
+                                  drawing.FontStyle.Bold)
+        inner.AddRow(lbl_w)
+
         self.sld_pf_attr, self.txt_pf_attr = self._float_slider(
             inner, "Attractor Pull", 0.0, 3.0, 1.5, self._noop)
         self.sld_pf_attr_r, self.txt_pf_attr_r = self._float_slider(
             inner, "Attr Radius", 1.0, 200.0, 50.0, self._noop)
-        self.sld_pf_momentum, self.txt_pf_momentum = self._float_slider(
-            inner, "Momentum", 0.0, 2.0, 0.8, self._noop)
-        self.sld_pf_sep, self.txt_pf_sep = self._float_slider(
-            inner, "Separation", 0.0, 2.0, 0.5, self._noop)
-        self.sld_pf_wander, self.txt_pf_wander = self._float_slider(
-            inner, "Wander", 0.0, 2.0, 0.3, self._noop)
-        self.sld_pf_seed, self.txt_pf_seed = self._int_slider(
-            inner, "Seed", 0, 100, 42, self._noop)
 
-        btn_gen_paths = forms.Button()
-        btn_gen_paths.Text = "Generate Paths"
-        btn_gen_paths.Click += self._on_generate_paths
-        btn_clr_paths = forms.Button()
-        btn_clr_paths.Text = "Clear Paths"
-        btn_clr_paths.Click += self._on_clear_paths
-        btn_bake_paths = forms.Button()
-        btn_bake_paths.Text = "Bake Paths"
-        btn_bake_paths.Click += self._on_bake_paths
-        inner.AddRow(btn_gen_paths, btn_clr_paths, btn_bake_paths)
+        inner.AddRow(None)
 
-        self.lbl_path_status = forms.Label()
-        self.lbl_path_status.Text = "Paths: 0"
-        inner.AddRow(self.lbl_path_status)
+        lbl_sm = forms.Label()
+        lbl_sm.Text = "Slime Mould Only"
+        lbl_sm.Font = drawing.Font(lbl_sm.Font.Family, lbl_sm.Font.Size,
+                                   drawing.FontStyle.Bold)
+        inner.AddRow(lbl_sm)
 
-        lbl_pd = forms.Label()
-        lbl_pd.Text = "-- Display --"
-        inner.AddRow(lbl_pd)
+        self.sld_mould_density, self.txt_mould_density = self._int_slider(
+            inner, "Mould Density", 1, 500, 5, self._noop)
+        self.sld_reinforce, self.txt_reinforce = self._float_slider(
+            inner, "Reinforcement", 0.0, 3.0, 0.8, self._noop)
+        self.sld_direction, self.txt_direction = self._float_slider(
+            inner, "Direction", 0.0, 3.0, 1.0, self._noop)
 
-        self.chk_show_paths = forms.CheckBox()
-        self.chk_show_paths.Text = "Show Paths"
-        self.chk_show_paths.Checked = True
-        self.chk_show_paths.CheckedChanged += lambda s, e: self._update_path_display()
+        inner.AddRow(None)
+
+        lbl_wact = forms.Label()
+        lbl_wact.Text = "Wander"
+        lbl_wact.Font = drawing.Font(lbl_wact.Font.Family, lbl_wact.Font.Size,
+                                     drawing.FontStyle.Bold)
+        inner.AddRow(lbl_wact)
+
+        btn_gen_wander = forms.Button()
+        btn_gen_wander.Text = "Generate Wander"
+        btn_gen_wander.Click += self._on_generate_wander
+        btn_clr_wander = forms.Button()
+        btn_clr_wander.Text = "Clear Wander"
+        btn_clr_wander.Click += self._on_clear_wander
+        inner.AddRow(btn_gen_wander, btn_clr_wander)
+
+        self.lbl_wander_status = forms.Label()
+        self.lbl_wander_status.Text = "Wander: 0"
+        inner.AddRow(self.lbl_wander_status)
+
+        self.chk_animate_wander = forms.CheckBox()
+        self.chk_animate_wander.Text = "Animate Wander"
+        self.chk_animate_wander.Checked = False
+        self.chk_animate_wander.CheckedChanged += self._on_toggle_animate_wander
+        inner.AddRow(self.chk_animate_wander)
+
+        self._anim_wander_panel = forms.DynamicLayout()
+        self._anim_wander_panel.DefaultSpacing = drawing.Size(4, 4)
+        self._anim_wander_panel.Padding = drawing.Padding(0)
+        self._anim_wander_panel.Visible = False
+
+        self.btn_anim_w_play = forms.Button()
+        self.btn_anim_w_play.Text = u"\u25B6 Play"
+        self.btn_anim_w_play.Width = 80
+        self.btn_anim_w_play.Click += self._on_anim_wander_play
+        self.btn_anim_w_pause = forms.Button()
+        self.btn_anim_w_pause.Text = u"\u23F8 Pause"
+        self.btn_anim_w_pause.Width = 80
+        self.btn_anim_w_pause.Enabled = False
+        self.btn_anim_w_pause.Click += self._on_anim_wander_pause
+        self.btn_anim_w_reset = forms.Button()
+        self.btn_anim_w_reset.Text = u"\u21BA Reset"
+        self.btn_anim_w_reset.Width = 80
+        self.btn_anim_w_reset.Click += self._on_anim_wander_reset
+        self._anim_wander_panel.AddRow(self.btn_anim_w_play, self.btn_anim_w_pause,
+                                       self.btn_anim_w_reset)
+
+        self.sld_anim_w_speed, self.txt_anim_w_speed = self._int_slider(
+            self._anim_wander_panel, "Speed", 1, 20, 5, self._on_anim_wander_speed_change)
+        self.lbl_anim_w_frame = forms.Label()
+        self.lbl_anim_w_frame.Text = "Frame: 0 / 0"
+        self._anim_wander_panel.AddRow(self.lbl_anim_w_frame)
+
+        inner.AddRow(self._anim_wander_panel)
+
+        inner.AddRow(None)
+
+        lbl_sact = forms.Label()
+        lbl_sact.Text = "Slime Mould"
+        lbl_sact.Font = drawing.Font(lbl_sact.Font.Family, lbl_sact.Font.Size,
+                                     drawing.FontStyle.Bold)
+        inner.AddRow(lbl_sact)
+
+        btn_wander_to_tgt = forms.Button()
+        btn_wander_to_tgt.Text = "Wander \u2192 Slime Targets"
+        btn_wander_to_tgt.Click += self._on_wander_to_targets
+        inner.AddRow(btn_wander_to_tgt)
+
+        btn_gen_slime = forms.Button()
+        btn_gen_slime.Text = "Generate Slime"
+        btn_gen_slime.Click += self._on_generate_slime
+        btn_clr_slime = forms.Button()
+        btn_clr_slime.Text = "Clear Slime"
+        btn_clr_slime.Click += self._on_clear_slime
+        inner.AddRow(btn_gen_slime, btn_clr_slime)
+
+        self.lbl_slime_status = forms.Label()
+        self.lbl_slime_status.Text = "Slime: 0"
+        inner.AddRow(self.lbl_slime_status)
+
+        self.chk_animate_slime = forms.CheckBox()
+        self.chk_animate_slime.Text = "Animate Slime"
+        self.chk_animate_slime.Checked = False
+        self.chk_animate_slime.CheckedChanged += self._on_toggle_animate_slime
+        inner.AddRow(self.chk_animate_slime)
+
+        self._anim_slime_panel = forms.DynamicLayout()
+        self._anim_slime_panel.DefaultSpacing = drawing.Size(4, 4)
+        self._anim_slime_panel.Padding = drawing.Padding(0)
+        self._anim_slime_panel.Visible = False
+
+        self.btn_anim_s_play = forms.Button()
+        self.btn_anim_s_play.Text = u"\u25B6 Play"
+        self.btn_anim_s_play.Width = 80
+        self.btn_anim_s_play.Click += self._on_anim_slime_play
+        self.btn_anim_s_pause = forms.Button()
+        self.btn_anim_s_pause.Text = u"\u23F8 Pause"
+        self.btn_anim_s_pause.Width = 80
+        self.btn_anim_s_pause.Enabled = False
+        self.btn_anim_s_pause.Click += self._on_anim_slime_pause
+        self.btn_anim_s_reset = forms.Button()
+        self.btn_anim_s_reset.Text = u"\u21BA Reset"
+        self.btn_anim_s_reset.Width = 80
+        self.btn_anim_s_reset.Click += self._on_anim_slime_reset
+        self._anim_slime_panel.AddRow(self.btn_anim_s_play, self.btn_anim_s_pause,
+                                      self.btn_anim_s_reset)
+
+        self.sld_anim_s_speed, self.txt_anim_s_speed = self._int_slider(
+            self._anim_slime_panel, "Speed", 1, 20, 5, self._on_anim_slime_speed_change)
+        self.lbl_anim_s_frame = forms.Label()
+        self.lbl_anim_s_frame.Text = "Frame: 0 / 0"
+        self._anim_slime_panel.AddRow(self.lbl_anim_s_frame)
+
+        inner.AddRow(self._anim_slime_panel)
+
+        inner.AddRow(None)
+
+        lbl_bake = forms.Label()
+        lbl_bake.Text = "Bake"
+        lbl_bake.Font = drawing.Font(lbl_bake.Font.Family, lbl_bake.Font.Size,
+                                     drawing.FontStyle.Bold)
+        inner.AddRow(lbl_bake)
+
+        lbl_bm = forms.Label()
+        lbl_bm.Text = "Bake Mode"
+        lbl_bm.Width = 105
+        self.dd_bake_mode = forms.DropDown()
+        self.dd_bake_mode.Width = 150
+        self.dd_bake_mode.Items.Add("All Together")
+        self.dd_bake_mode.Items.Add("Group by Type")
+        self.dd_bake_mode.Items.Add("Group by Agent")
+        self.dd_bake_mode.SelectedIndex = 1
+        inner.AddRow(lbl_bm, self.dd_bake_mode)
+
+        btn_bake_w = forms.Button()
+        btn_bake_w.Text = "Bake Wander"
+        btn_bake_w.Width = 100
+        btn_bake_w.Click += self._on_bake_wander
+        btn_bake_s = forms.Button()
+        btn_bake_s.Text = "Bake Slime"
+        btn_bake_s.Width = 100
+        btn_bake_s.Click += self._on_bake_slime
+        btn_bake_all = forms.Button()
+        btn_bake_all.Text = "Bake All"
+        btn_bake_all.Width = 80
+        btn_bake_all.Click += self._on_bake_all
+        inner.AddRow(btn_bake_w, btn_bake_s, btn_bake_all)
+
+        inner.AddRow(None)
+
+        lbl_wd = forms.Label()
+        lbl_wd.Text = "Wander Display"
+        lbl_wd.Font = drawing.Font(lbl_wd.Font.Family, lbl_wd.Font.Size,
+                                   drawing.FontStyle.Bold)
+        inner.AddRow(lbl_wd)
+
+        self.chk_show_wander = forms.CheckBox()
+        self.chk_show_wander.Text = "Show Wander"
+        self.chk_show_wander.Checked = True
+        self.chk_show_wander.CheckedChanged += lambda s, e: self._update_path_display()
+        inner.AddRow(self.chk_show_wander)
+
+        self.sld_wander_width, self.txt_wander_width = self._int_slider(
+            inner, "Width", 1, 10, 2, self._update_path_display)
+        self.sld_wander_opacity, self.txt_wander_opacity = self._int_slider(
+            inner, "Opacity", 0, 255, 255, self._update_path_display)
+
+        self.btn_wander_col = forms.Button()
+        self.btn_wander_col.Text = "Wander Colour"
+        self.btn_wander_col.Width = 120
+        self.btn_wander_col.BackgroundColor = drawing.Color.FromArgb(255, 200, 50)
+        self.btn_wander_col.Click += self._on_pick_wander_color
+        inner.AddRow(self.btn_wander_col)
+
+        inner.AddRow(None)
+
+        lbl_sd = forms.Label()
+        lbl_sd.Text = "Slime Mould Display"
+        lbl_sd.Font = drawing.Font(lbl_sd.Font.Family, lbl_sd.Font.Size,
+                                   drawing.FontStyle.Bold)
+        inner.AddRow(lbl_sd)
+
+        self.chk_show_slime = forms.CheckBox()
+        self.chk_show_slime.Text = "Show Slime"
+        self.chk_show_slime.Checked = True
+        self.chk_show_slime.CheckedChanged += lambda s, e: self._update_path_display()
+        inner.AddRow(self.chk_show_slime)
+
+        self.sld_slime_width, self.txt_slime_width = self._int_slider(
+            inner, "Width", 1, 10, 2, self._update_path_display)
+        self.sld_slime_opacity, self.txt_slime_opacity = self._int_slider(
+            inner, "Opacity", 0, 255, 255, self._update_path_display)
+
+        self.btn_slime_col = forms.Button()
+        self.btn_slime_col.Text = "Slime Colour"
+        self.btn_slime_col.Width = 120
+        self.btn_slime_col.BackgroundColor = drawing.Color.FromArgb(50, 220, 120)
+        self.btn_slime_col.Click += self._on_pick_slime_color
+        inner.AddRow(self.btn_slime_col)
+
+        inner.AddRow(None)
+
+        lbl_ptd = forms.Label()
+        lbl_ptd.Text = "Points"
+        lbl_ptd.Font = drawing.Font(lbl_ptd.Font.Family, lbl_ptd.Font.Size,
+                                    drawing.FontStyle.Bold)
+        inner.AddRow(lbl_ptd)
 
         self.chk_show_path_pts = forms.CheckBox()
         self.chk_show_path_pts.Text = "Show Points"
         self.chk_show_path_pts.Checked = True
         self.chk_show_path_pts.CheckedChanged += lambda s, e: self._update_path_display()
-        inner.AddRow(self.chk_show_paths, self.chk_show_path_pts)
+        inner.AddRow(self.chk_show_path_pts)
 
-        self.sld_path_width, self.txt_path_width = self._int_slider(
-            inner, "Path Width", 1, 10, 2, self._update_path_display)
         self.sld_pt_size, self.txt_pt_size = self._int_slider(
             inner, "Point Size", 2, 20, 8, self._update_path_display)
 
-        self.btn_path_col = forms.Button()
-        self.btn_path_col.Text = "Path Colour"
-        self.btn_path_col.BackgroundColor = drawing.Color.FromArgb(255, 200, 50)
-        self.btn_path_col.Click += self._on_pick_path_color
-
         self.btn_pt_col = forms.Button()
         self.btn_pt_col.Text = "Point Colour"
+        self.btn_pt_col.Width = 120
         self.btn_pt_col.BackgroundColor = drawing.Color.FromArgb(255, 80, 80)
         self.btn_pt_col.Click += self._on_pick_point_color
-        inner.AddRow(self.btn_path_col, self.btn_pt_col)
+        inner.AddRow(self.btn_pt_col)
 
-        exp.Content = inner
-        layout.AddRow(exp)
+        _sec_finish()
+
+        # -- path influence ------------------------------------------------
+        inner, _sec_finish = self._section(layout, "Path Influence", True)
+
+        self.chk_use_paths = forms.CheckBox()
+        self.chk_use_paths.Text = "Use Paths as Attractors"
+        self.chk_use_paths.Checked = False
+        self.chk_use_paths.CheckedChanged += lambda s, e: self._mark_compute()
+        inner.AddRow(self.chk_use_paths)
+
+        self.chk_path_carve = forms.CheckBox()
+        self.chk_path_carve.Text = "Carve Mode (remove voxels near paths)"
+        self.chk_path_carve.Checked = False
+        self.chk_path_carve.CheckedChanged += lambda s, e: self._mark_compute()
+        inner.AddRow(self.chk_path_carve)
+
+        self.sld_path_r, self.txt_path_r = self._int_slider(
+            inner, "Influence Radius (cells)", 0, 30, 3, self._mark_compute)
+        self.sld_path_s, self.txt_path_s = self._float_slider(
+            inner, "Path Strength", 0.0, 3.0, 1.0, self._mark_compute)
+
+        inner.AddRow(None)
+
+        self.chk_show_influence = forms.CheckBox()
+        self.chk_show_influence.Text = "Show Influence Paths"
+        self.chk_show_influence.Checked = True
+        self.chk_show_influence.CheckedChanged += lambda s, e: self._update_influence_display()
+        inner.AddRow(self.chk_show_influence)
+
+        self.sld_inf_width, self.txt_inf_width = self._int_slider(
+            inner, "Line Width", 1, 10, 2, self._update_influence_display)
+
+        self.btn_inf_col = forms.Button()
+        self.btn_inf_col.Text = "Path Colour"
+        self.btn_inf_col.Width = 120
+        self.btn_inf_col.BackgroundColor = drawing.Color.FromArgb(255, 130, 50)
+        self.btn_inf_col.Click += self._on_pick_influence_color
+        btn_clr_inf = forms.Button()
+        btn_clr_inf.Text = "Clear Paths"
+        btn_clr_inf.Width = 100
+        btn_clr_inf.Click += self._on_clear_influence
+        inner.AddRow(self.btn_inf_col, btn_clr_inf)
+
+        inner.AddRow(None)
+        inner.AddRow(self._bold("Noise Variation"))
+
+        self.sld_scale, self.txt_scale = self._float_slider(
+            inner, "Noise Scale", 0.01, 1.0, 0.15, self._mark_compute)
+        self.sld_thresh, self.txt_thresh = self._float_slider(
+            inner, "Threshold", 0.0, 1.0, 0.45, self._mark_compute)
+        self.sld_oct, self.txt_oct = self._int_slider(
+            inner, "Octaves", 1, 6, 3, self._mark_compute)
+        self.sld_seed, self.txt_seed = self._int_slider(
+            inner, "Seed", 0, 100, 0, self._mark_compute)
+
+        _sec_finish()
 
         # -- display -------------------------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Display")
-        exp.Expanded = False
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
+        inner, _sec_finish = self._section(layout, "Display", False)
 
         self.chk_show_voxels = forms.CheckBox()
         self.chk_show_voxels.Text = "Show Voxels"
@@ -1569,6 +2190,8 @@ class VoxelDialog(forms.Form):
 
         self.sld_opacity, self.txt_opacity = self._int_slider(
             inner, "Voxel Opacity", 0, 255, 255, self._update_opacity)
+        self.sld_edge_opacity, self.txt_edge_opacity = self._int_slider(
+            inner, "Edge Opacity", 0, 255, 255, self._update_edge_opacity)
 
         self.btn_vcol = forms.Button()
         self.btn_vcol.Text = "Voxel Colour"
@@ -1590,7 +2213,7 @@ class VoxelDialog(forms.Form):
         lbl_low.Text = "Low"
         lbl_low.Width = 30
         self.gradient_bar = forms.Drawable()
-        self.gradient_bar.Size = drawing.Size(200, 18)
+        self.gradient_bar.Size = drawing.Size(180, 18)
         self.gradient_bar.Paint += self._on_gradient_paint
         lbl_high = forms.Label()
         lbl_high.Text = "High"
@@ -1601,15 +2224,10 @@ class VoxelDialog(forms.Form):
         lbl_grad_desc.Text = "Colour = noise density (threshold \u2192 max)"
         inner.AddRow(lbl_grad_desc)
 
-        exp.Content = inner
-        layout.AddRow(exp)
+        _sec_finish()
 
         # -- controls ------------------------------------------------------
-        exp = forms.Expander()
-        exp.Header = self._bold("Controls")
-        exp.Expanded = True
-        inner = forms.DynamicLayout()
-        inner.DefaultSpacing = drawing.Size(4, 4)
+        inner, _sec_finish = self._section(layout, "Controls", True)
 
         btn_refresh = forms.Button()
         btn_refresh.Text = "Refresh"
@@ -1632,10 +2250,10 @@ class VoxelDialog(forms.Form):
         self.lbl_status.Text = "Ready"
         inner.AddRow(self.lbl_status)
 
-        exp.Content = inner
-        layout.AddRow(exp)
+        _sec_finish()
 
         scrollable = forms.Scrollable()
+        scrollable.ExpandContentWidth = True
         scrollable.Content = layout
         self.Content = scrollable
         self.Closed += self._on_closed
@@ -1647,6 +2265,52 @@ class VoxelDialog(forms.Form):
         lbl.Text = text
         lbl.Font = drawing.Font(lbl.Font.Family, lbl.Font.Size, drawing.FontStyle.Bold)
         return lbl
+
+    def _section(self, parent_layout, title, expanded=False):
+        """Create a collapsible section with arrow indicator.
+        Returns the inner DynamicLayout to add rows to.
+        Call _section_end(parent_layout, ...) is not needed -- the section
+        is self-contained and added to parent_layout immediately via the
+        returned objects.  Usage:
+
+            inner, finish = self._section(layout, "Title", expanded=True)
+            inner.AddRow(...)
+            finish()
+        """
+        arrow_open = u"\u25BC "
+        arrow_closed = u"\u25B6 "
+
+        header = forms.Label()
+        header.Text = (arrow_open if expanded else arrow_closed) + title
+        header.Font = drawing.Font(header.Font.Family,
+                                   header.Font.Size + 1,
+                                   drawing.FontStyle.Bold)
+        header.Cursor = forms.Cursors.Pointer
+
+        panel = forms.DynamicLayout()
+        panel.DefaultSpacing = drawing.Size(4, 4)
+        panel.Padding = drawing.Padding(8, 4, 4, 4)
+        panel.Visible = expanded
+
+        def toggle(sender, e):
+            panel.Visible = not panel.Visible
+            if panel.Visible:
+                header.Text = arrow_open + title
+            else:
+                header.Text = arrow_closed + title
+
+        header.MouseDown += toggle
+
+        sep = forms.Label()
+        sep.Text = ""
+        sep.Height = 2
+
+        def finish():
+            parent_layout.AddRow(sep)
+            parent_layout.AddRow(header)
+            parent_layout.AddRow(panel)
+
+        return panel, finish
 
     def _int_slider(self, layout, name, lo, hi, default, on_change):
         """Create a label + slider + text box row for integer parameters.
@@ -1782,8 +2446,10 @@ class VoxelDialog(forms.Form):
         return sld.Value
 
     def _read_params(self):
-        """Collect all UI parameter values into a single tuple for passing
-        to generate() and update_display()."""
+        """Collect all UI parameter values into a single tuple.
+        Layout:  0-2  gx,gy,gz   3-5  cw,cl,ch   6-9  scale,thresh,octaves,seed
+                10-13 use_paths,path_r,path_s,path_carve
+                14-15 use_bounds,bounds_strict   16 grid_type"""
         gx = self._ival(self.txt_gx, self.sld_gx)
         gy = self._ival(self.txt_gy, self.sld_gy)
         gz = self._ival(self.txt_gz, self.sld_gz)
@@ -1794,26 +2460,21 @@ class VoxelDialog(forms.Form):
         thresh = self._fval(self.txt_thresh, self.sld_thresh, 0.0, 1.0)
         octaves = self._ival(self.txt_oct, self.sld_oct)
         seed = self._ival(self.txt_seed, self.sld_seed)
-        use_attr = self.chk_attr.Checked == True
-        attr_r = self._fval(self.txt_attr_r, self.sld_attr_r, 1.0, 50.0)
-        attr_s = self._fval(self.txt_attr_s, self.sld_attr_s, 0.0, 1.0)
-        use_base = self.chk_use_base.Checked == True
-        base_r = self._fval(self.txt_base_r, self.sld_base_r, 1.0, 80.0)
-        base_s = self._fval(self.txt_base_s, self.sld_base_s, 0.0, 1.0)
-        base_carve = self.chk_carve.Checked == True
+        use_paths = self.chk_use_paths.Checked == True
+        path_r = self._ival(self.txt_path_r, self.sld_path_r)
+        path_s = self._fval(self.txt_path_s, self.sld_path_s, 0.0, 3.0)
+        path_carve = self.chk_path_carve.Checked == True
         use_bounds = self.chk_use_bounds.Checked == True
         bounds_strict = self.dd_clip_mode.SelectedIndex == 1
-        fill_grid = self.chk_fill_grid.Checked == True
         grid_type = self.dd_grid_type.SelectedIndex
         return (gx, gy, gz, cw, cl, ch, scale, thresh, octaves, seed,
-                use_attr, attr_r, attr_s,
-                use_base, base_r, base_s, base_carve,
-                use_bounds, bounds_strict, fill_grid, grid_type)
+                use_paths, path_r, path_s, path_carve,
+                use_bounds, bounds_strict, grid_type)
 
     # -- compute grid origin -----------------------------------------------
     def _grid_origin(self, gx, gy, gz, cw, cl, ch):
-        """Return the world-space corner of the grid. Bounds centering takes
-        priority over base centering when both are active."""
+        """Return the world-space corner of the grid.  Centres on bounds
+        geometry when Auto-Center on Bounds is active."""
         if (self.chk_bounds_center.Checked == True and
                 self.bounds_aabb and self.bounds_aabb.IsValid and
                 self.chk_use_bounds.Checked == True):
@@ -1822,52 +2483,63 @@ class VoxelDialog(forms.Form):
                 c.X - (gx * cw) * 0.5,
                 c.Y - (gy * cl) * 0.5,
                 c.Z - (gz * ch) * 0.5)
-        if (self.chk_auto_center.Checked == True and
-                self.base_geometries and
-                self.chk_use_base.Checked == True):
-            bbox = rg.BoundingBox.Empty
-            for geo in self.base_geometries:
-                gb = geo.GetBoundingBox(True)
-                bbox.Union(gb)
-            if bbox.IsValid:
-                c = bbox.Center
-                return rg.Point3d(
-                    c.X - (gx * cw) * 0.5,
-                    c.Y - (gy * cl) * 0.5,
-                    c.Z - (gz * ch) * 0.5)
         return rg.Point3d.Origin
 
     # -- full regenerate ---------------------------------------------------
     def _full_regenerate(self):
-        """Recompute noise field from scratch, rebuild mesh, and update display.
-        Triggered by changes to grid size, noise params, or attractors."""
+        """Recompute voxel field, rebuild mesh, and update display.
+        Captures existing path trails as curves before clearing them."""
         p = self._read_params()
         gx, gy, gz = p[0], p[1], p[2]
         cw, cl, ch = p[3], p[4], p[5]
         scale, thresh, octaves, seed = p[6], p[7], p[8], p[9]
-        use_attr, attr_r, attr_s = p[10], p[11], p[12]
-        use_base, base_r, base_s, base_carve = p[13], p[14], p[15], p[16]
-        use_bounds, bounds_strict = p[17], p[18]
-        fill_grid = p[19]
-        grid_type = p[20]
+        use_paths, path_r, path_s, path_carve = p[10], p[11], p[12], p[13]
+        use_bounds, bounds_strict = p[14], p[15]
+        grid_type = p[16]
+
+        path_keys = set()
+        all_trails = (self.system.conduit.wander_trails +
+                      self.system.conduit.slime_trails)
+        if use_paths:
+            for key_trail in self.pathfinder.trail_keys:
+                for k in key_trail:
+                    path_keys.add(k)
+
+        if all_trails:
+            self.system.conduit.influence_trails = [
+                list(t) for t in all_trails if len(t) > 1]
 
         origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
         total = gx * gy * gz
         self.pathfinder.trails = []
+        self.pathfinder.trail_keys = []
         self.pathfinder.graph = {}
-        self.system.conduit.path_trails = []
+        self.system.conduit.wander_trails = []
+        self.system.conduit.slime_trails = []
         self.system.conduit.path_points = []
-        if hasattr(self, 'lbl_path_status'):
-            self.lbl_path_status.Text = "Paths: 0"
+        self._anim_wander_trails = []
+        self._anim_wander_max_frame = 0
+        self._anim_slime_trails = []
+        self._anim_slime_max_frame = 0
+        if hasattr(self, '_anim_wander_timer'):
+            self._anim_wander_stop()
+        if hasattr(self, '_anim_slime_timer'):
+            self._anim_slime_stop()
+        if hasattr(self, 'lbl_anim_w_frame'):
+            self.lbl_anim_w_frame.Text = "Frame: 0 / 0"
+        if hasattr(self, 'lbl_anim_s_frame'):
+            self.lbl_anim_s_frame.Text = "Frame: 0 / 0"
+        if hasattr(self, 'lbl_wander_status'):
+            self.lbl_wander_status.Text = "Wander: 0"
+        if hasattr(self, 'lbl_slime_status'):
+            self.lbl_slime_status.Text = "Slime: 0"
         self.lbl_status.Text = "Computing {} cells...".format(total)
 
         voxels = self.system.generate(
             gx, gy, gz, cw, cl, ch, scale, thresh, octaves, seed,
-            use_attr, self.attractor_pts, self.attractor_curves,
-            self.attractor_geos, attr_r, attr_s,
-            use_base, self.base_geometries, base_r, base_s, base_carve,
+            use_paths, path_keys, path_r, path_s, path_carve,
             use_bounds, self.bounds_meshes, self.bounds_aabb, bounds_strict,
-            fill_grid, grid_type, origin)
+            grid_type, origin)
 
         show_bounds = self.chk_bounds.Checked == True
         show_edges = self.chk_edges.Checked == True
@@ -1890,7 +2562,7 @@ class VoxelDialog(forms.Form):
         p = self._read_params()
         gx, gy, gz = p[0], p[1], p[2]
         cw, cl, ch = p[3], p[4], p[5]
-        grid_type = p[20]
+        grid_type = p[16]
         origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
         voxels = self.system.voxels
         show_bounds = self.chk_bounds.Checked == True
@@ -1977,52 +2649,39 @@ class VoxelDialog(forms.Form):
 
     def _on_clear(self, sender, e):
         """Remove all preview geometry and reset state."""
+        self._anim_wander_stop()
+        self._anim_slime_stop()
+        self._anim_wander_trails = []
+        self._anim_wander_max_frame = 0
+        self._anim_slime_trails = []
+        self._anim_slime_max_frame = 0
+        if hasattr(self, 'lbl_anim_w_frame'):
+            self.lbl_anim_w_frame.Text = "Frame: 0 / 0"
+        if hasattr(self, 'lbl_anim_s_frame'):
+            self.lbl_anim_s_frame.Text = "Frame: 0 / 0"
         self.system.conduit.mesh = None
         self.system.conduit.edge_mesh = None
         self.system.conduit.bound_lines = []
-        self.system.conduit.path_trails = []
+        self.system.conduit.wander_trails = []
+        self.system.conduit.slime_trails = []
         self.system.conduit.path_points = []
         self.system.voxels = []
         self.pathfinder.trails = []
+        self.pathfinder.trail_keys = []
         self.pathfinder.graph = {}
         sc.doc.Views.Redraw()
         self.lbl_status.Text = "Cleared"
-        self.lbl_path_status.Text = "Paths: 0"
+        if hasattr(self, 'lbl_wander_status'):
+            self.lbl_wander_status.Text = "Wander: 0"
+        if hasattr(self, 'lbl_slime_status'):
+            self.lbl_slime_status.Text = "Slime: 0"
 
     def _on_closed(self, sender, e):
         """Clean up when the dialog window is closed."""
         self._timer.Stop()
+        self._anim_wander_timer.Stop()
+        self._anim_slime_timer.Stop()
         self.system.dispose()
-
-    # -- base geometry -----------------------------------------------------
-    def _on_pick_base(self, sender, e):
-        """Prompt user to select base geometry objects from the Rhino viewport."""
-        self.Visible = False
-        go = Rhino.Input.Custom.GetObject()
-        go.SetCommandPrompt("Select base geometry (curves, meshes, surfaces, breps)")
-        go.GeometryFilter = (
-            Rhino.DocObjects.ObjectType.Curve |
-            Rhino.DocObjects.ObjectType.Mesh |
-            Rhino.DocObjects.ObjectType.Surface |
-            Rhino.DocObjects.ObjectType.Brep)
-        go.EnablePreSelect(False, True)
-        go.GetMultiple(1, 0)
-        if go.CommandResult() == Rhino.Commands.Result.Success:
-            self.base_geometries = []
-            for i in range(go.ObjectCount):
-                geo = go.Object(i).Geometry()
-                if geo:
-                    self.base_geometries.append(geo.Duplicate())
-            self.lbl_base.Text = "Base: {} object(s)".format(len(self.base_geometries))
-            self.chk_use_base.Checked = True
-        self.Visible = True
-        self._full_regenerate()
-
-    def _on_clear_base(self, sender, e):
-        self.base_geometries = []
-        self.chk_use_base.Checked = False
-        self.lbl_base.Text = "Base: None"
-        self._full_regenerate()
 
     # -- bounding geometry -------------------------------------------------
     def _preprocess_bounds(self):
@@ -2082,86 +2741,6 @@ class VoxelDialog(forms.Form):
         self.bounds_aabb = None
         self.chk_use_bounds.Checked = False
         self.lbl_bounds.Text = "Bounds: None"
-        self._full_regenerate()
-
-    # -- attractors --------------------------------------------------------
-    def _on_pick_attractors(self, sender, e):
-        """Prompt user to select point objects as density attractors."""
-        self.Visible = False
-        go = Rhino.Input.Custom.GetObject()
-        go.SetCommandPrompt("Select attractor points")
-        go.GeometryFilter = Rhino.DocObjects.ObjectType.Point
-        go.EnablePreSelect(False, True)
-        go.GetMultiple(1, 0)
-        if go.CommandResult() == Rhino.Commands.Result.Success:
-            self.attractor_pts = []
-            for i in range(go.ObjectCount):
-                pt = go.Object(i).Point().Location
-                self.attractor_pts.append(pt)
-            self.lbl_attr_count.Text = "Points: {}".format(len(self.attractor_pts))
-        self.Visible = True
-        self._full_regenerate()
-
-    def _on_clear_attractors(self, sender, e):
-        self.attractor_pts = []
-        self.lbl_attr_count.Text = "Points: 0"
-        self._full_regenerate()
-
-    # -- attractor curves --------------------------------------------------
-    def _on_pick_attractor_curves(self, sender, e):
-        """Prompt user to select curves as density attractors."""
-        self.Visible = False
-        go = Rhino.Input.Custom.GetObject()
-        go.SetCommandPrompt("Select attractor curves")
-        go.GeometryFilter = Rhino.DocObjects.ObjectType.Curve
-        go.EnablePreSelect(False, True)
-        go.GetMultiple(1, 0)
-        if go.CommandResult() == Rhino.Commands.Result.Success:
-            self.attractor_curves = []
-            for i in range(go.ObjectCount):
-                geo = go.Object(i).Geometry()
-                if geo:
-                    self.attractor_curves.append(geo.Duplicate())
-            self.lbl_attr_crv_count.Text = "Curves: {}".format(len(self.attractor_curves))
-        self.Visible = True
-        self._full_regenerate()
-
-    def _on_clear_attractor_curves(self, sender, e):
-        self.attractor_curves = []
-        self.lbl_attr_crv_count.Text = "Curves: 0"
-        self._full_regenerate()
-
-    # -- attractor geometries ----------------------------------------------
-    def _on_pick_attractor_geos(self, sender, e):
-        """Prompt user to select meshes/breps/surfaces as density attractors."""
-        self.Visible = False
-        go = Rhino.Input.Custom.GetObject()
-        go.SetCommandPrompt("Select attractor geometries (meshes, surfaces, breps)")
-        go.GeometryFilter = (
-            Rhino.DocObjects.ObjectType.Mesh |
-            Rhino.DocObjects.ObjectType.Surface |
-            Rhino.DocObjects.ObjectType.Brep |
-            Rhino.DocObjects.ObjectType.Extrusion)
-        go.EnablePreSelect(False, True)
-        go.GetMultiple(1, 0)
-        if go.CommandResult() == Rhino.Commands.Result.Success:
-            self.attractor_geos = []
-            for i in range(go.ObjectCount):
-                geo = go.Object(i).Geometry()
-                if geo:
-                    dup = geo.Duplicate()
-                    if isinstance(dup, rg.Extrusion):
-                        brep = dup.ToBrep()
-                        if brep:
-                            dup = brep
-                    self.attractor_geos.append(dup)
-            self.lbl_attr_geo_count.Text = "Geometries: {}".format(len(self.attractor_geos))
-        self.Visible = True
-        self._full_regenerate()
-
-    def _on_clear_attractor_geos(self, sender, e):
-        self.attractor_geos = []
-        self.lbl_attr_geo_count.Text = "Geometries: 0"
         self._full_regenerate()
 
     # -- custom voxel geometry ---------------------------------------------
@@ -2291,6 +2870,12 @@ class VoxelDialog(forms.Form):
         self.system.conduit.voxel_opacity = val
         sc.doc.Views.Redraw()
 
+    def _update_edge_opacity(self):
+        """Push edge opacity to conduit."""
+        val = self._ival(self.txt_edge_opacity, self.sld_edge_opacity)
+        self.system.conduit.edge_opacity = val
+        sc.doc.Views.Redraw()
+
     def _update_voxel_visibility(self):
         """Toggle voxel mesh visibility."""
         self.system.conduit.show_voxels = self.chk_show_voxels.Checked == True
@@ -2299,27 +2884,44 @@ class VoxelDialog(forms.Form):
     # -- path display ------------------------------------------------------
     def _update_path_display(self):
         """Push current path display settings to conduit and redraw."""
-        self.system.conduit.show_paths = self.chk_show_paths.Checked == True
-        self.system.conduit.show_path_points = self.chk_show_path_pts.Checked == True
-        self.system.conduit.path_thickness = self._ival(
-            self.txt_path_width, self.sld_path_width)
-        self.system.conduit.path_point_size = self._ival(
+        c = self.system.conduit
+        c.show_wander = self.chk_show_wander.Checked == True
+        c.show_slime = self.chk_show_slime.Checked == True
+        c.show_path_points = self.chk_show_path_pts.Checked == True
+        c.wander_thickness = self._ival(
+            self.txt_wander_width, self.sld_wander_width)
+        c.slime_thickness = self._ival(
+            self.txt_slime_width, self.sld_slime_width)
+        c.wander_opacity = self._ival(
+            self.txt_wander_opacity, self.sld_wander_opacity)
+        c.slime_opacity = self._ival(
+            self.txt_slime_opacity, self.sld_slime_opacity)
+        c.path_point_size = self._ival(
             self.txt_pt_size, self.sld_pt_size)
         sc.doc.Views.Redraw()
 
     # -- start point handlers ----------------------------------------------
     def _on_pick_start_pts(self, sender, e):
         """Let user pick points in the viewport as path start locations."""
-        pts = rs.GetPoints(True, message1="Pick start points (Enter to finish)")
+        self.Visible = False
+        gp = Rhino.Input.Custom.GetPoint()
+        gp.SetCommandPrompt("Pick start points (Enter when done)")
+        pts = []
+        while True:
+            gp.Get()
+            if gp.CommandResult() != Rhino.Commands.Result.Success:
+                break
+            pts.append(rg.Point3d(gp.Point()))
         if pts:
-            self.pathfinder.start_points = [rg.Point3d(p.X, p.Y, p.Z) for p in pts]
-            self.lbl_start_count.Text = "Start Pts: {}".format(len(self.pathfinder.start_points))
-            self.system.conduit.path_points = list(self.pathfinder.start_points)
+            self.pathfinder.start_points = pts
+            self.lbl_start_count.Text = str(len(pts))
+            self.system.conduit.path_points = list(pts)
             sc.doc.Views.Redraw()
+        self.Visible = True
 
     def _on_clear_start_pts(self, sender, e):
         self.pathfinder.start_points = []
-        self.lbl_start_count.Text = "Start Pts: 0"
+        self.lbl_start_count.Text = "0"
         self.system.conduit.path_points = []
         sc.doc.Views.Redraw()
 
@@ -2327,13 +2929,13 @@ class VoxelDialog(forms.Form):
         """Auto-generate start points from graph nodes."""
         voxels = self.system.voxels
         if not voxels:
-            self.lbl_start_count.Text = "No voxels"
+            self.lbl_start_count.Text = "err"
             return
         if not self.pathfinder.graph:
             p = self._read_params()
             gx, gy, gz = p[0], p[1], p[2]
             cw, cl, ch = p[3], p[4], p[5]
-            grid_type = p[20]
+            grid_type = p[16]
             origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
             mode = self.dd_graph_mode.SelectedIndex
             if mode == 0:
@@ -2345,150 +2947,506 @@ class VoxelDialog(forms.Form):
         count = self._ival(self.txt_pf_agents, self.sld_pf_agents)
         seed = self._ival(self.txt_pf_seed, self.sld_pf_seed)
         self.pathfinder.generate_random_starts(count, seed)
-        self.lbl_start_count.Text = "Start Pts: {}".format(len(self.pathfinder.start_points))
+        self.lbl_start_count.Text = str(len(self.pathfinder.start_points))
         self.system.conduit.path_points = list(self.pathfinder.start_points)
         sc.doc.Views.Redraw()
 
     # -- target pickers ----------------------------------------------------
     def _on_pick_target_pts(self, sender, e):
-        pts = rs.GetPoints(True, message1="Pick target points (Enter to finish)")
+        """Pick target attractor points in the viewport."""
+        self.Visible = False
+        gp = Rhino.Input.Custom.GetPoint()
+        gp.SetCommandPrompt("Pick target points (Enter when done)")
+        pts = []
+        while True:
+            gp.Get()
+            if gp.CommandResult() != Rhino.Commands.Result.Success:
+                break
+            pts.append(rg.Point3d(gp.Point()))
         if pts:
-            self.pathfinder.target_points = [rg.Point3d(p.X, p.Y, p.Z) for p in pts]
-            self.lbl_tgt_pt_count.Text = "Target Pts: {}".format(
-                len(self.pathfinder.target_points))
+            self.pathfinder.target_points = pts
+            self.lbl_tgt_pt_count.Text = str(len(pts))
+        self.Visible = True
 
     def _on_clear_target_pts(self, sender, e):
         self.pathfinder.target_points = []
-        self.lbl_tgt_pt_count.Text = "Target Pts: 0"
+        self.lbl_tgt_pt_count.Text = "0"
 
     def _on_pick_target_curves(self, sender, e):
-        ids = rs.GetObjects("Select target curves", rs.filter.curve)
-        if ids:
-            self.pathfinder.target_curves = [
-                rs.coercecurve(cid) for cid in ids if rs.coercecurve(cid)]
-            self.lbl_tgt_crv_count.Text = "Target Curves: {}".format(
+        """Select curves as pathfinding attractors."""
+        self.Visible = False
+        go = Rhino.Input.Custom.GetObject()
+        go.SetCommandPrompt("Select target curves")
+        go.GeometryFilter = Rhino.DocObjects.ObjectType.Curve
+        go.EnablePreSelect(False, True)
+        go.GetMultiple(1, 0)
+        if go.CommandResult() == Rhino.Commands.Result.Success:
+            self.pathfinder.target_curves = []
+            for i in range(go.ObjectCount):
+                geo = go.Object(i).Geometry()
+                if geo:
+                    self.pathfinder.target_curves.append(geo.Duplicate())
+            self.lbl_tgt_crv_count.Text = str(
                 len(self.pathfinder.target_curves))
+        self.Visible = True
 
     def _on_clear_target_curves(self, sender, e):
         self.pathfinder.target_curves = []
-        self.lbl_tgt_crv_count.Text = "Target Curves: 0"
+        self.lbl_tgt_crv_count.Text = "0"
 
     def _on_pick_target_geos(self, sender, e):
-        ids = rs.GetObjects("Select target meshes/breps/surfaces",
-                            rs.filter.mesh | rs.filter.polysurface | rs.filter.surface)
-        if ids:
-            geos = []
-            for gid in ids:
-                g = rs.coercemesh(gid) or rs.coercebrep(gid) or rs.coercesurface(gid)
-                if g:
-                    geos.append(g)
-            self.pathfinder.target_geos = geos
-            self.lbl_tgt_geo_count.Text = "Target Geos: {}".format(
+        """Select meshes/breps/surfaces as pathfinding attractors."""
+        self.Visible = False
+        go = Rhino.Input.Custom.GetObject()
+        go.SetCommandPrompt("Select target geometries (meshes, surfaces, breps)")
+        go.GeometryFilter = (
+            Rhino.DocObjects.ObjectType.Mesh |
+            Rhino.DocObjects.ObjectType.Surface |
+            Rhino.DocObjects.ObjectType.Brep |
+            Rhino.DocObjects.ObjectType.Extrusion)
+        go.EnablePreSelect(False, True)
+        go.GetMultiple(1, 0)
+        if go.CommandResult() == Rhino.Commands.Result.Success:
+            self.pathfinder.target_geos = []
+            for i in range(go.ObjectCount):
+                geo = go.Object(i).Geometry()
+                if geo:
+                    dup = geo.Duplicate()
+                    if isinstance(dup, rg.Extrusion):
+                        brep = dup.ToBrep()
+                        if brep:
+                            dup = brep
+                    self.pathfinder.target_geos.append(dup)
+            self.lbl_tgt_geo_count.Text = str(
                 len(self.pathfinder.target_geos))
+        self.Visible = True
 
     def _on_clear_target_geos(self, sender, e):
         self.pathfinder.target_geos = []
-        self.lbl_tgt_geo_count.Text = "Target Geos: 0"
+        self.lbl_tgt_geo_count.Text = "0"
 
     # -- generate / clear / bake paths -------------------------------------
-    def _on_generate_paths(self, sender, e):
-        """Build graph from current voxels and run pathfinding."""
+    def _ensure_graph(self):
+        """Build graph from current voxels if needed."""
         voxels = self.system.voxels
         if not voxels:
-            self.lbl_path_status.Text = "No voxels -- generate first"
-            return
-
+            return False
         p = self._read_params()
         gx, gy, gz = p[0], p[1], p[2]
         cw, cl, ch = p[3], p[4], p[5]
-        grid_type = p[20]
+        grid_type = p[16]
         origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
-
-        mode = self.dd_graph_mode.SelectedIndex
-        self.lbl_path_status.Text = "Building {} graph...".format(
-            "centre" if mode == 0 else "edge")
-        if mode == 0:
+        graph_mode = self.dd_graph_mode.SelectedIndex
+        if graph_mode == 0:
             self.pathfinder.build_centre_graph(
                 voxels, cw, cl, ch, origin, grid_type)
         else:
             self.pathfinder.build_edge_graph(
                 voxels, cw, cl, ch, origin, grid_type)
+        return True
 
-        if not self.pathfinder.start_points:
-            count = self._ival(self.txt_pf_agents, self.sld_pf_agents)
-            seed = self._ival(self.txt_pf_seed, self.sld_pf_seed)
-            self.pathfinder.generate_random_starts(count, seed)
-            self.lbl_start_count.Text = "Start Pts: {} (auto)".format(
-                len(self.pathfinder.start_points))
-
+    def _on_generate_wander(self, sender, e):
+        """Run wander pathfinding from start points."""
+        if not self._ensure_graph():
+            self.lbl_wander_status.Text = "No voxels -- generate first"
+            return
         max_steps = self._ival(self.txt_pf_steps, self.sld_pf_steps)
-        branch_prob = self._fval(
-            self.txt_pf_branch, self.sld_pf_branch, 0.0, 0.3)
-        max_branches = self._ival(self.txt_pf_max_br, self.sld_pf_max_br)
         density_str = self._fval(
             self.txt_pf_density, self.sld_pf_density, 0.0, 2.0)
-        attr_str = self._fval(
-            self.txt_pf_attr, self.sld_pf_attr, 0.0, 3.0)
-        attr_r = self._fval(
-            self.txt_pf_attr_r, self.sld_pf_attr_r, 1.0, 200.0)
         momentum = self._fval(
             self.txt_pf_momentum, self.sld_pf_momentum, 0.0, 2.0)
         separation = self._fval(
             self.txt_pf_sep, self.sld_pf_sep, 0.0, 2.0)
         wander = self._fval(
             self.txt_pf_wander, self.sld_pf_wander, 0.0, 2.0)
+        repulse_r = self._fval(
+            self.txt_pf_repulse, self.sld_pf_repulse, 0.0, 50.0)
         pf_seed = self._ival(self.txt_pf_seed, self.sld_pf_seed)
+        branch_prob = self._fval(
+            self.txt_pf_branch, self.sld_pf_branch, 0.0, 0.5)
+        max_branches = self._ival(self.txt_pf_max_br, self.sld_pf_max_br)
+        attr_str = self._fval(
+            self.txt_pf_attr, self.sld_pf_attr, 0.0, 3.0)
+        attr_r = self._fval(
+            self.txt_pf_attr_r, self.sld_pf_attr_r, 1.0, 200.0)
 
-        self.lbl_path_status.Text = "Running pathfinding..."
+        if not self.pathfinder.start_points:
+            count = self._ival(self.txt_pf_agents, self.sld_pf_agents)
+            self.pathfinder.generate_random_starts(count, pf_seed)
+            self.lbl_start_count.Text = "{} auto".format(
+                len(self.pathfinder.start_points))
+
+        self.lbl_wander_status.Text = "Running wander..."
         trails = self.pathfinder.find_paths(
             max_steps, branch_prob, max_branches,
-            density_str, attr_str, attr_r,
+            density_str, attr_str, attr_r, repulse_r,
             momentum, separation, wander, pf_seed)
-
-        self.system.conduit.path_trails = trails
+        self.system.conduit.wander_trails = trails
         self.system.conduit.path_points = list(self.pathfinder.start_points)
+        self._anim_wander_stop()
+        self._anim_wander_prepare()
         self._update_path_display()
-
         total_pts = sum(len(t) for t in trails)
-        self.lbl_path_status.Text = "{} paths, {} segments".format(
+        self.lbl_wander_status.Text = "{} paths, {} segs".format(
             len(trails), total_pts)
 
-    def _on_clear_paths(self, sender, e):
-        """Clear all paths from display."""
-        self.pathfinder.trails = []
-        self.system.conduit.path_trails = []
-        self.system.conduit.path_points = []
-        sc.doc.Views.Redraw()
-        self.lbl_path_status.Text = "Paths: 0"
-
-    def _on_bake_paths(self, sender, e):
-        """Bake path trails as polyline curves and start points to the document."""
-        trails = self.pathfinder.trails
-        if not trails:
-            self.lbl_path_status.Text = "No paths to bake"
+    def _on_generate_slime(self, sender, e):
+        """Run slime mould pathfinding from targets."""
+        if not self._ensure_graph():
+            self.lbl_slime_status.Text = "No voxels -- generate first"
             return
-        count = 0
+        has_targets = (self.pathfinder.target_points or
+                       self.pathfinder.target_curves or
+                       self.pathfinder.target_geos)
+        if not has_targets:
+            self.lbl_slime_status.Text = "Slime needs targets -- assign pts/curves/geos"
+            return
+        max_steps = self._ival(self.txt_pf_steps, self.sld_pf_steps)
+        density_str = self._fval(
+            self.txt_pf_density, self.sld_pf_density, 0.0, 2.0)
+        momentum = self._fval(
+            self.txt_pf_momentum, self.sld_pf_momentum, 0.0, 2.0)
+        separation = self._fval(
+            self.txt_pf_sep, self.sld_pf_sep, 0.0, 2.0)
+        wander = self._fval(
+            self.txt_pf_wander, self.sld_pf_wander, 0.0, 2.0)
+        repulse_r = self._fval(
+            self.txt_pf_repulse, self.sld_pf_repulse, 0.0, 50.0)
+        pf_seed = self._ival(self.txt_pf_seed, self.sld_pf_seed)
+        branch_prob = self._fval(
+            self.txt_pf_branch, self.sld_pf_branch, 0.0, 0.5)
+        max_branches = self._ival(self.txt_pf_max_br, self.sld_pf_max_br)
+        mould_d = self._ival(self.txt_mould_density, self.sld_mould_density)
+        reinforce = self._fval(
+            self.txt_reinforce, self.sld_reinforce, 0.0, 3.0)
+        direction = self._fval(
+            self.txt_direction, self.sld_direction, 0.0, 3.0)
+
+        self.lbl_slime_status.Text = "Growing slime ({} agents)...".format(
+            mould_d * len(self.pathfinder._collect_anchors()))
+        trails = self.pathfinder.find_slime_paths(
+            max_steps, density_str, momentum, separation,
+            wander, repulse_r, mould_d, reinforce,
+            direction, branch_prob, max_branches, pf_seed)
+        anchors = self.pathfinder._collect_anchors()
+        self.system.conduit.slime_trails = trails
+        self.system.conduit.path_points = [a[1] for a in anchors]
+        self._anim_slime_stop()
+        self._anim_slime_prepare()
+        self._update_path_display()
+        total_pts = sum(len(t) for t in trails)
+        self.lbl_slime_status.Text = "{} paths, {} segs".format(
+            len(trails), total_pts)
+
+    def _on_clear_wander(self, sender, e):
+        self._anim_wander_stop()
+        self._anim_wander_trails = []
+        self._anim_wander_max_frame = 0
+        self.lbl_anim_w_frame.Text = "Frame: 0 / 0"
+        self.system.conduit.wander_trails = []
+        if self.system.conduit.slime_trails:
+            anchors = self.pathfinder._collect_anchors()
+            self.system.conduit.path_points = [a[1] for a in anchors]
+        else:
+            self.system.conduit.path_points = []
+        sc.doc.Views.Redraw()
+        self.lbl_wander_status.Text = "Wander: 0"
+
+    def _on_clear_slime(self, sender, e):
+        self._anim_slime_stop()
+        self._anim_slime_trails = []
+        self._anim_slime_max_frame = 0
+        self.lbl_anim_s_frame.Text = "Frame: 0 / 0"
+        self.system.conduit.slime_trails = []
+        if self.system.conduit.wander_trails:
+            self.system.conduit.path_points = list(self.pathfinder.start_points)
+        else:
+            self.system.conduit.path_points = []
+        sc.doc.Views.Redraw()
+        self.lbl_slime_status.Text = "Slime: 0"
+
+    def _on_wander_to_targets(self, sender, e):
+        """Copy wander trails as target curves for slime mould mode."""
+        trails = self.system.conduit.wander_trails
+        if not trails:
+            self.lbl_slime_status.Text = "No wander paths to use"
+            return
+        curves = []
         for trail in trails:
             if len(trail) > 1:
-                plc = rg.PolylineCurve(trail)
-                sc.doc.Objects.AddCurve(plc)
-                count += 1
+                curves.append(rg.PolylineCurve(trail))
+        if curves:
+            self.pathfinder.target_curves = (
+                self.pathfinder.target_curves + curves)
+            self.lbl_tgt_crv_count.Text = str(
+                len(self.pathfinder.target_curves))
+            self.lbl_slime_status.Text = "{} wander curves added as targets".format(
+                len(curves))
+
+    def _bake_trails(self, trails, layer_prefix, group_mode):
+        """Bake a set of trails with grouping options.
+        group_mode: 0=all together, 1=group by type, 2=group by agent."""
+        if not trails:
+            return 0
+        attr = Rhino.DocObjects.ObjectAttributes()
+        if not sc.doc.Layers.FindName(layer_prefix):
+            sc.doc.Layers.Add(layer_prefix,
+                              System.Drawing.Color.FromArgb(200, 200, 200))
+        layer_idx = sc.doc.Layers.FindName(layer_prefix).Index
+        attr.LayerIndex = layer_idx
+
+        if group_mode == 0:
+            grp = sc.doc.Groups.Add()
+            count = 0
+            for trail in trails:
+                if len(trail) > 1:
+                    plc = rg.PolylineCurve(trail)
+                    oid = sc.doc.Objects.AddCurve(plc, attr)
+                    sc.doc.Groups.AddToGroup(grp, oid)
+                    count += 1
+            return count
+        elif group_mode == 1:
+            grp = sc.doc.Groups.Add("{}_all".format(layer_prefix))
+            count = 0
+            for trail in trails:
+                if len(trail) > 1:
+                    plc = rg.PolylineCurve(trail)
+                    oid = sc.doc.Objects.AddCurve(plc, attr)
+                    sc.doc.Groups.AddToGroup(grp, oid)
+                    count += 1
+            return count
+        else:
+            count = 0
+            for i, trail in enumerate(trails):
+                if len(trail) > 1:
+                    grp = sc.doc.Groups.Add(
+                        "{}_agent_{}".format(layer_prefix, i))
+                    plc = rg.PolylineCurve(trail)
+                    oid = sc.doc.Objects.AddCurve(plc, attr)
+                    sc.doc.Groups.AddToGroup(grp, oid)
+                    count += 1
+            return count
+
+    def _on_bake_wander(self, sender, e):
+        trails = self.system.conduit.wander_trails
+        if not trails:
+            self.lbl_wander_status.Text = "No wander paths to bake"
+            return
+        mode = self.dd_bake_mode.SelectedIndex
+        count = self._bake_trails(trails, "Wander_Paths", mode)
+        sc.doc.Views.Redraw()
+        self.lbl_wander_status.Text = "Baked {} wander paths".format(count)
+
+    def _on_bake_slime(self, sender, e):
+        trails = self.system.conduit.slime_trails
+        if not trails:
+            self.lbl_slime_status.Text = "No slime paths to bake"
+            return
+        mode = self.dd_bake_mode.SelectedIndex
+        count = self._bake_trails(trails, "Slime_Paths", mode)
+        sc.doc.Views.Redraw()
+        self.lbl_slime_status.Text = "Baked {} slime paths".format(count)
+
+    def _on_bake_all(self, sender, e):
+        mode = self.dd_bake_mode.SelectedIndex
+        w = self._bake_trails(
+            self.system.conduit.wander_trails, "Wander_Paths", mode)
+        s = self._bake_trails(
+            self.system.conduit.slime_trails, "Slime_Paths", mode)
+        if w + s == 0:
+            self.lbl_wander_status.Text = "No paths to bake"
+            return
         for sp in self.pathfinder.start_points:
             sc.doc.Objects.AddPoint(sp)
         sc.doc.Views.Redraw()
-        self.lbl_path_status.Text = "Baked {} paths + {} pts".format(
-            count, len(self.pathfinder.start_points))
+        self.lbl_wander_status.Text = "Baked {} wander + {} slime".format(w, s)
+
+    # -- animation controls -------------------------------------------------
+    def _on_toggle_animate_wander(self, sender, e):
+        self._anim_wander_panel.Visible = self.chk_animate_wander.Checked
+        if not self.chk_animate_wander.Checked:
+            self._anim_wander_stop()
+
+    def _on_toggle_animate_slime(self, sender, e):
+        self._anim_slime_panel.Visible = self.chk_animate_slime.Checked
+        if not self.chk_animate_slime.Checked:
+            self._anim_slime_stop()
+
+    def _on_anim_wander_speed_change(self):
+        speed = self._ival(self.txt_anim_w_speed, self.sld_anim_w_speed)
+        self._anim_wander_timer.Interval = max(0.01, 0.2 / speed)
+
+    def _on_anim_slime_speed_change(self):
+        speed = self._ival(self.txt_anim_s_speed, self.sld_anim_s_speed)
+        self._anim_slime_timer.Interval = max(0.01, 0.2 / speed)
+
+    def _anim_wander_prepare(self):
+        trails = self.system.conduit.wander_trails
+        if not trails:
+            return
+        self._anim_wander_trails = [list(t) for t in trails]
+        self._anim_wander_points = list(self.system.conduit.path_points)
+        self._anim_wander_max_frame = max(len(t) for t in trails)
+        self._anim_wander_frame = 0
+        self.lbl_anim_w_frame.Text = "Frame: 0 / {}".format(
+            self._anim_wander_max_frame)
+
+    def _anim_slime_prepare(self):
+        trails = self.system.conduit.slime_trails
+        if not trails:
+            return
+        self._anim_slime_trails = [list(t) for t in trails]
+        self._anim_slime_points = list(self.system.conduit.path_points)
+        self._anim_slime_max_frame = max(len(t) for t in trails)
+        self._anim_slime_frame = 0
+        self.lbl_anim_s_frame.Text = "Frame: 0 / {}".format(
+            self._anim_slime_max_frame)
+
+    def _anim_wander_show_frame(self, frame):
+        visible = []
+        for trail in self._anim_wander_trails:
+            n = min(frame + 1, len(trail))
+            if n >= 2:
+                visible.append(trail[:n])
+        self.system.conduit.wander_trails = visible
+        if frame == 0:
+            self.system.conduit.path_points = list(self._anim_wander_points)
+        sc.doc.Views.Redraw()
+
+    def _anim_slime_show_frame(self, frame):
+        visible = []
+        for trail in self._anim_slime_trails:
+            n = min(frame + 1, len(trail))
+            if n >= 2:
+                visible.append(trail[:n])
+        self.system.conduit.slime_trails = visible
+        if frame == 0:
+            self.system.conduit.path_points = list(self._anim_slime_points)
+        sc.doc.Views.Redraw()
+
+    def _on_anim_wander_play(self, sender, e):
+        trails = self.system.conduit.wander_trails
+        if not trails:
+            self.lbl_wander_status.Text = "Generate wander first"
+            return
+        if self._anim_wander_max_frame == 0:
+            self._anim_wander_prepare()
+        if self._anim_wander_frame >= self._anim_wander_max_frame:
+            self._anim_wander_frame = 0
+        self._anim_wander_playing = True
+        self.btn_anim_w_play.Enabled = False
+        self.btn_anim_w_pause.Enabled = True
+        self._on_anim_wander_speed_change()
+        self._anim_wander_timer.Start()
+
+    def _on_anim_wander_pause(self, sender, e):
+        self._anim_wander_playing = False
+        self._anim_wander_timer.Stop()
+        self.btn_anim_w_play.Enabled = True
+        self.btn_anim_w_pause.Enabled = False
+
+    def _on_anim_wander_reset(self, sender, e):
+        self._anim_wander_stop()
+        if self._anim_wander_trails:
+            self.system.conduit.wander_trails = self._anim_wander_trails
+            sc.doc.Views.Redraw()
+            total = sum(len(t) for t in self._anim_wander_trails)
+            self.lbl_wander_status.Text = "{} paths, {} segs".format(
+                len(self._anim_wander_trails), total)
+        self.lbl_anim_w_frame.Text = "Frame: 0 / {}".format(
+            self._anim_wander_max_frame)
+
+    def _anim_wander_stop(self):
+        self._anim_wander_playing = False
+        self._anim_wander_timer.Stop()
+        self._anim_wander_frame = 0
+        self.btn_anim_w_play.Enabled = True
+        self.btn_anim_w_pause.Enabled = False
+
+    def _on_anim_wander_tick(self, sender, e):
+        if not self._anim_wander_playing:
+            return
+        self._anim_wander_frame += 1
+        if self._anim_wander_frame > self._anim_wander_max_frame:
+            self._anim_wander_frame = self._anim_wander_max_frame
+            self._on_anim_wander_pause(None, None)
+            return
+        self._anim_wander_show_frame(self._anim_wander_frame)
+        self.lbl_anim_w_frame.Text = "Frame: {} / {}".format(
+            self._anim_wander_frame, self._anim_wander_max_frame)
+
+    def _on_anim_slime_play(self, sender, e):
+        trails = self.system.conduit.slime_trails
+        if not trails:
+            self.lbl_slime_status.Text = "Generate slime first"
+            return
+        if self._anim_slime_max_frame == 0:
+            self._anim_slime_prepare()
+        if self._anim_slime_frame >= self._anim_slime_max_frame:
+            self._anim_slime_frame = 0
+        self._anim_slime_playing = True
+        self.btn_anim_s_play.Enabled = False
+        self.btn_anim_s_pause.Enabled = True
+        self._on_anim_slime_speed_change()
+        self._anim_slime_timer.Start()
+
+    def _on_anim_slime_pause(self, sender, e):
+        self._anim_slime_playing = False
+        self._anim_slime_timer.Stop()
+        self.btn_anim_s_play.Enabled = True
+        self.btn_anim_s_pause.Enabled = False
+
+    def _on_anim_slime_reset(self, sender, e):
+        self._anim_slime_stop()
+        if self._anim_slime_trails:
+            self.system.conduit.slime_trails = self._anim_slime_trails
+            sc.doc.Views.Redraw()
+            total = sum(len(t) for t in self._anim_slime_trails)
+            self.lbl_slime_status.Text = "{} paths, {} segs".format(
+                len(self._anim_slime_trails), total)
+        self.lbl_anim_s_frame.Text = "Frame: 0 / {}".format(
+            self._anim_slime_max_frame)
+
+    def _anim_slime_stop(self):
+        self._anim_slime_playing = False
+        self._anim_slime_timer.Stop()
+        self._anim_slime_frame = 0
+        self.btn_anim_s_play.Enabled = True
+        self.btn_anim_s_pause.Enabled = False
+
+    def _on_anim_slime_tick(self, sender, e):
+        if not self._anim_slime_playing:
+            return
+        self._anim_slime_frame += 1
+        if self._anim_slime_frame > self._anim_slime_max_frame:
+            self._anim_slime_frame = self._anim_slime_max_frame
+            self._on_anim_slime_pause(None, None)
+            return
+        self._anim_slime_show_frame(self._anim_slime_frame)
+        self.lbl_anim_s_frame.Text = "Frame: {} / {}".format(
+            self._anim_slime_frame, self._anim_slime_max_frame)
 
     # -- colour pickers for paths and points --------------------------------
-    def _on_pick_path_color(self, sender, e):
+    def _on_pick_wander_color(self, sender, e):
         cd = forms.ColorDialog()
-        pc = self.system.conduit.path_color
-        cd.Color = drawing.Color.FromArgb(pc.R, pc.G, pc.B)
+        wc = self.system.conduit.wander_color
+        cd.Color = drawing.Color.FromArgb(wc.R, wc.G, wc.B)
         if cd.ShowDialog(self) == forms.DialogResult.Ok:
             c = cd.Color
-            self.system.conduit.path_color = System.Drawing.Color.FromArgb(
+            self.system.conduit.wander_color = System.Drawing.Color.FromArgb(
                 c.Rb, c.Gb, c.Bb)
-            self.btn_path_col.BackgroundColor = c
+            self.btn_wander_col.BackgroundColor = c
+            sc.doc.Views.Redraw()
+
+    def _on_pick_slime_color(self, sender, e):
+        cd = forms.ColorDialog()
+        sc_col = self.system.conduit.slime_color
+        cd.Color = drawing.Color.FromArgb(sc_col.R, sc_col.G, sc_col.B)
+        if cd.ShowDialog(self) == forms.DialogResult.Ok:
+            c = cd.Color
+            self.system.conduit.slime_color = System.Drawing.Color.FromArgb(
+                c.Rb, c.Gb, c.Bb)
+            self.btn_slime_col.BackgroundColor = c
             sc.doc.Views.Redraw()
 
     def _on_pick_point_color(self, sender, e):
@@ -2501,6 +3459,28 @@ class VoxelDialog(forms.Form):
                 c.Rb, c.Gb, c.Bb)
             self.btn_pt_col.BackgroundColor = c
             sc.doc.Views.Redraw()
+
+    # -- influence path display --------------------------------------------
+    def _update_influence_display(self):
+        cond = self.system.conduit
+        cond.show_influence = self.chk_show_influence.Checked == True
+        cond.influence_thickness = self._ival(self.txt_inf_width, self.sld_inf_width)
+        sc.doc.Views.Redraw()
+
+    def _on_pick_influence_color(self, sender, e):
+        cd = forms.ColorDialog()
+        ic = self.system.conduit.influence_color
+        cd.Color = drawing.Color.FromArgb(ic.R, ic.G, ic.B)
+        if cd.ShowDialog(self) == forms.DialogResult.Ok:
+            c = cd.Color
+            self.system.conduit.influence_color = System.Drawing.Color.FromArgb(
+                c.Rb, c.Gb, c.Bb)
+            self.btn_inf_col.BackgroundColor = c
+            sc.doc.Views.Redraw()
+
+    def _on_clear_influence(self, sender, e):
+        self.system.conduit.influence_trails = []
+        sc.doc.Views.Redraw()
 
 
 # ---------------------------------------------------------------------------
