@@ -11,15 +11,16 @@ Path-driven voxel field tool — generates a plain filled grid, then uses wander
 
 ## Architecture
 
-The script is a single-file tool with five main classes:
+The script is a single-file tool with six main classes:
 
 | Class | Role |
 |-------|------|
 | `PerlinNoise` | Deterministic 3D gradient noise with octave layering |
-| `VoxelConduit` | Rhino DisplayConduit subclass — draws preview meshes (with opacity), bounds, path trails, and start/end point markers directly into the viewport without baking |
+| `VoxelConduit` | Rhino DisplayConduit subclass — draws preview meshes (with opacity), bounds, path trails, boid agents/trails, and start/end point markers directly into the viewport without baking |
 | `VoxelSystem` | Core engine — generates voxel fields and builds meshes for display |
-| `VoxelPathfinder` | Pathfinding engine — builds a traversal graph (voxel-centre adjacency or wireframe-edge adjacency) from the voxel field, runs scored greedy walks from user-assigned or auto-generated start points toward optional attractor geometry, with branching support |
-| `VoxelDialog` | Eto.Forms UI — all sliders, buttons, and colour pickers in collapsible `Expander` sections. Uses a debounced UITimer (0.12s) with two dirty flags to separate heavy recomputes from cheap display refreshes |
+| `VoxelPathfinder` | Pathfinding engine — builds a traversal graph from the voxel field, runs scored greedy walks with attractor support and branching |
+| `BoidGrowthSystem` | Boid-based growth simulation — agents flock through 3D space depositing density on nearby voxel cells, creating smooth organic growth with attractor support |
+| `VoxelDialog` | Eto.Forms UI — all sliders, buttons, and colour pickers in collapsible sections. Uses debounced UITimers with dirty flags to separate heavy recomputes from cheap display refreshes |
 
 ## Current Capabilities
 
@@ -57,7 +58,7 @@ Generated wander and slime mould paths act as attractors (or subtractors in carv
 
 **Carve mode**: Noise provides a base 0–1 field. Within the influence radius, density is reduced by `(1 - d/radius) * strength`. Result: tunnels/voids are carved along paths with organic edges.
 
-**Parameters**:
+**Path Influence Parameters**:
 
 | Parameter | Range | Default | Effect |
 |-----------|-------|---------|--------|
@@ -65,6 +66,51 @@ Generated wander and slime mould paths act as attractors (or subtractors in carv
 | Carve Mode | checkbox | off | Subtract density near paths (default: concentrate) |
 | Influence Radius (cells) | 0–30 | 3 | Number of grid cells of influence around each path cell |
 | Path Strength | 0–3 | 1.0 | Effect intensity (>1 gives hard contrast) |
+
+### External Geometry Influence
+
+External geometry (curves, breps, meshes, surfaces) can be assigned as additional influence sources to sculpt the voxel field. Geometry can operate in three distinct modes: attract voxels toward it, carve away voxels, or use it as a bounding constraint to clip the voxel field.
+
+**Workflow:**
+1. Generate or adjust the base voxel field (with or without path influence)
+2. Click **Assign Geometry** in the External Geometry Influence section
+3. Select one or more curves, breps, meshes, or surfaces in the viewport
+4. Set the influence radius (how far from the geometry the effect reaches)
+5. Set the geometry strength (effect intensity)
+6. Choose an **Influence Mode** from the dropdown:
+   - **Concentrate** — attract voxels toward the geometry (default)
+   - **Carve** — remove voxels near the geometry
+   - **Constrain** — use geometry as a clipping volume (keep only voxels inside)
+7. Click Refresh — voxels are shaped according to the mode
+
+**Detection method:** For each voxel position, the closest distance to any assigned geometry is computed. Geometry types supported:
+- Rhino **Curves** — closest point calculation via `Curve.ClosestPoint()`
+- Rhino **Meshes** — closest point via `Mesh.ClosestPoint()`
+- Rhino **Breps** — closest point via `Brep.ClosestPoint()`
+- Rhino **Surfaces** — closest point via `Surface.ClosestPoint()`
+- Rhino **Extrusions** — automatically converted to Breps
+
+**Concentrate mode** (default): Within the influence radius, density is boosted by `(1 - d/radius) * strength` where d is the distance to the geometry. Outside the radius, the geometry has no effect. Result: voxels cluster and attach to assigned geometry with organic edges.
+
+**Carve mode**: Within the influence radius, density is reduced by `(1 - d/radius) * strength`. Outside the radius, the geometry has no effect. Result: tunnels or voids are carved along geometry paths with organic edges.
+
+**Constrain mode**: Geometry acts as a bounding volume. Voxels outside the geometry (where distance > 0.01) are discarded entirely, regardless of their density value. This is equivalent to using the assigned geometry as a closed clipping container. Works best with closed breps or meshes.
+
+**External Geometry Influence Parameters**:
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Assign Geometry | button | — | Pick curves, breps, meshes, or surfaces as influence |
+| Clear Geometry | button | — | Remove assigned influence geometry |
+| Geometry count | label | None | Display count of assigned influence sources |
+| Geometry Influence Radius | 0–30 | 3 | Distance from geometry where influence is active (modes 0, 1) |
+| Geometry Strength | 0–3 | 1.0 | Effect intensity (boost or carve) |
+| Influence Mode | dropdown | Concentrate | How geometry affects voxels: Concentrate, Carve, or Constrain |
+
+**Noise Variation Parameters** (shared by both path and geometry influence):
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
 | Noise Scale | 0.01–1.0 | 0.15 | Perlin noise frequency (organic variation) |
 | Threshold | 0–1 | 0.45 | Density cutoff for voxel visibility |
 | Octaves | 1–6 | 3 | Noise detail layers |
@@ -79,6 +125,38 @@ Generated wander and slime mould paths act as attractors (or subtractors in carv
 - Custom geometry is normalised to unit size and replicated at each voxel position
 - Configurable custom scale factor
 - Feature edge detection for wireframe overlay on custom shapes
+
+### Shell Operations
+
+Shell operations allow you to create hollow voxel structures and adjust their thickness via offset operations.
+
+**Workflow:**
+1. Generate a solid voxel field (using paths, external geometry, bounding volumes, or plain noise)
+2. Enable **Hollow Out** checkbox to reduce the voxel set to only surface voxels (one voxel thick)
+3. Optionally enable **Shell Offset** and choose a direction:
+   - Set offset to positive value with **Outward** — expand shell outward by that many voxel layers
+   - Set offset to positive value with **Inward** — contract shell inward by that many voxel layers
+4. Click Refresh — voxels are hollowed and optionally offset
+
+**Hollow algorithm**: Iterates through all voxels and keeps only those with at least one empty neighbor (checking the full 26-neighbor 3D neighborhood). Result: a shell exactly one voxel thick.
+
+**Offset algorithm**:
+- **Outward offset**: Expands the shell by adding all neighbors to the voxel set, repeated N times
+- **Inward offset**: Contracts the shell by removing any voxel that has an empty neighbor, repeated N times
+
+**Shell Operations Parameters**:
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Hollow Out | checkbox | off | Reduce voxels to outer surface layer only |
+| Shell Offset | -10 to 10 | 0 | Number of voxel layers to expand/contract |
+| Offset Direction | dropdown | Outward | Expand outward or contract inward |
+
+**Use cases:**
+- Create thin-walled structures for lightweight fabrication
+- Generate architectural shells from solid voxel volumes
+- Build custom thickness walls by combining hollow + offset
+- Combine with path/geometry influence for organic hollow forms
 
 ### Pathfinding
 
@@ -214,6 +292,87 @@ To make the slime mould consume the entire voxel volume:
 | Point Size | 2–20 | 8 | Display size of markers |
 | Point Colour | picker | red (255,80,80) | Colour of point markers |
 
+### Boid Growth
+
+Boid-based growth simulation where autonomous agents flock through 3D space using classic separation/alignment/cohesion rules. As agents move they deposit density on nearby voxel cells, creating smooth organic growth patterns over time.
+
+**Workflow:**
+1. Configure agent count, flocking parameters, and growth settings
+2. Optionally pick attractor geometry (curves, meshes, breps, surfaces) to guide agents
+3. Click **Play** — agents spawn at random grid positions and begin flocking
+4. Watch voxels grow smoothly in real time as agents deposit density
+5. Click **Pause** to freeze, **Play** to resume
+6. Click **Apply** to commit the grown voxels to the main system (enables baking)
+7. Click **Reset** to clear all growth and start over
+
+**Flocking rules:**
+- **Separation**: agents steer away from nearby neighbours (within separation radius)
+- **Alignment**: agents match velocity direction of nearby neighbours (within alignment radius)
+- **Cohesion**: agents steer toward the center of nearby neighbours (within cohesion radius)
+- All three rules use configurable weights and radii
+
+**Growth mechanism:**
+- Each simulation step, every agent deposits density on grid cells within its growth radius
+- Density falloff is linear: `1 - distance/radius` — cells at the agent position get full deposit, cells at the edge get minimal
+- Density accumulates over time — cells near frequently-visited areas become denser
+- Growth threshold controls which cells become visible voxels
+
+**Attractor support:**
+- Pick any combination of curves, meshes, breps, or surfaces as attractors
+- Agents experience a force pulling them toward the nearest point on the nearest attractor
+- Attractor strength controls pull intensity — higher values create tighter clustering around attractors
+- Distance-based: `force = attractor_strength / distance` toward closest point on attractor
+
+**Boundary modes:**
+- **Bounce**: agents reflect off grid boundaries (contained within the voxel volume)
+- **Wrap**: agents teleport to the opposite edge (toroidal space)
+
+#### Boid Growth Parameters
+
+**Agents:**
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Agent Count | 1–100 | 15 | Number of flocking agents |
+| Max Speed | 0.1–100 | 8.0 | Maximum agent velocity per step |
+| Seed | 0–100 | 42 | Random seed for spawn positions and initial velocities |
+
+**Flocking Rules:**
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Sep Weight | 0–5 | 1.5 | Separation force strength |
+| Sep Radius | 0.1–200 | 15.0 | Distance within which separation applies |
+| Align Weight | 0–5 | 1.0 | Alignment force strength |
+| Align Radius | 0.1–200 | 25.0 | Distance within which alignment applies |
+| Cohesion Weight | 0–5 | 1.0 | Cohesion force strength |
+| Cohesion Radius | 0.1–200 | 30.0 | Distance within which cohesion applies |
+
+**Growth:**
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Growth Radius | 0–10 | 2 | Cell radius of density deposition around each agent |
+| Growth Strength | 0.001–0.5 | 0.05 | Density added per step per cell (with falloff) |
+| Growth Threshold | 0–1 | 0.15 | Minimum density for a cell to become a visible voxel |
+| Boundary | dropdown | Bounce | How agents interact with grid edges |
+
+**Attractors:**
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Attractor Strength | 0–10 | 2.0 | Pull force toward nearest attractor geometry |
+
+**Display:**
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| Show Agents | checkbox | on | Display agent positions as dots |
+| Show Trails | checkbox | on | Display agent movement trails as polylines |
+| Trail Thickness | 1–10 | 2 | Trail line width |
+| Agent Colour | picker | pink (255,80,200) | Agent dot colour |
+| Trail Colour | picker | purple (200,100,255) | Trail polyline colour |
+
 ### Display
 - Live viewport preview via DisplayConduit (no baking required)
 - **Show Voxels** checkbox — hide voxel mesh while keeping paths visible
@@ -254,9 +413,12 @@ To make the slime mould consume the entire voxel volume:
 
 ## Ideas to Explore
 - [x] Path trail attractors — use generated paths as density modifiers (concentrate or carve)
+- [x] External geometry influence — assign curves, breps, meshes as attractor sources
+- [x] Shell operations — hollow out voxels and offset shells inward/outward
 - [ ] Trail mesh generation — sweep a profile along paths for 3D mycelium tubes
 - [ ] Multi-agent species — different agent groups with competing rules/targets
 - [x] Animated growth — step-by-step path growth with play/pause
+- [x] Boid agent growth — flocking agents deposit density for smooth organic voxel growth
 - [ ] Multi-material / multi-colour voxels based on density ranges
 - [ ] Export to STL or OBJ for 3D printing
 - [ ] Marching cubes for smooth isosurface extraction instead of boxes

@@ -129,6 +129,15 @@ class VoxelConduit(rd.DisplayConduit):
         self.influence_thickness = 2
         self.show_influence = True
 
+        self.boid_points = []
+        self.boid_color = System.Drawing.Color.FromArgb(255, 80, 200)
+        self.boid_size = 6
+        self.boid_trails = []
+        self.boid_trail_color = System.Drawing.Color.FromArgb(200, 100, 255)
+        self.boid_trail_thickness = 2
+        self.show_boids = True
+        self.show_boid_trails = True
+
     def CalculateBoundingBox(self, e):
         if self.bbox.IsValid:
             e.IncludeBoundingBox(self.bbox)
@@ -202,6 +211,20 @@ class VoxelConduit(rd.DisplayConduit):
             pc = self.path_point_color
             for pt in self.path_points:
                 _dppt(pt, _style, ps, pc)
+        if self.show_boid_trails and self.boid_trails:
+            btc = self.boid_trail_color
+            btt = self.boid_trail_thickness
+            _dp = disp.DrawPolyline
+            for trail in self.boid_trails:
+                if len(trail) > 1:
+                    _dp(trail, btc, btt)
+        if self.show_boids and self.boid_points:
+            _dppt = disp.DrawPoint
+            _style = rd.PointStyle.RoundControlPoint
+            bs = self.boid_size
+            bc = self.boid_color
+            for pt in self.boid_points:
+                _dppt(pt, _style, bs, bc)
 
 
 # ---------------------------------------------------------------------------
@@ -276,17 +299,107 @@ class VoxelSystem(object):
                                     influence[k2] = dsq2
         return influence
 
+    def _hollow_voxels(self, voxel_list):
+        """Keep only voxels on the outer shell (one voxel thick).
+        Returns list of voxels that are on the surface."""
+        if not voxel_list:
+            return []
+        
+        voxel_set = set((v[0], v[1], v[2]) for v in voxel_list)
+        voxel_map = {(v[0], v[1], v[2]): v for v in voxel_list}
+        shell_voxels = []
+        
+        for vx, vy, vz, density in voxel_list:
+            is_surface = False
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        neighbor = (vx + dx, vy + dy, vz + dz)
+                        if neighbor not in voxel_set:
+                            is_surface = True
+                            break
+                    if is_surface:
+                        break
+                if is_surface:
+                    break
+            
+            if is_surface:
+                shell_voxels.append((vx, vy, vz, density))
+        
+        return shell_voxels
+
+    def _offset_shell(self, voxel_list, offset_distance, offset_outward):
+        """Offset hollowed voxels outward or inward by a given distance.
+        offset_distance: number of voxel steps to expand/contract
+        offset_outward: True for outward offset, False for inward"""
+        if not voxel_list or offset_distance == 0:
+            return voxel_list
+        
+        voxel_set = set((v[0], v[1], v[2]) for v in voxel_list)
+        voxel_map = {(v[0], v[1], v[2]): v for v in voxel_list}
+        result_set = set(voxel_set)
+        
+        if offset_outward:
+            for _ in range(abs(offset_distance)):
+                expanded = set(result_set)
+                for vx, vy, vz in result_set:
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            for dz in (-1, 0, 1):
+                                if dx == 0 and dy == 0 and dz == 0:
+                                    continue
+                                neighbor = (vx + dx, vy + dy, vz + dz)
+                                expanded.add(neighbor)
+                result_set = expanded
+        else:
+            for _ in range(abs(offset_distance)):
+                contracted = set()
+                for vx, vy, vz in result_set:
+                    keep = True
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            for dz in (-1, 0, 1):
+                                if dx == 0 and dy == 0 and dz == 0:
+                                    continue
+                                neighbor = (vx + dx, vy + dy, vz + dz)
+                                if neighbor not in result_set:
+                                    keep = False
+                                    break
+                            if not keep:
+                                break
+                        if not keep:
+                            break
+                    if keep:
+                        contracted.add((vx, vy, vz))
+                result_set = contracted
+        
+        result_voxels = []
+        for vx, vy, vz in result_set:
+            if (vx, vy, vz) in voxel_map:
+                result_voxels.append(voxel_map[(vx, vy, vz)])
+            else:
+                result_voxels.append((vx, vy, vz, 0.5))
+        
+        return result_voxels
+
     def generate(self, grid_x, grid_y, grid_z, cell_w, cell_l, cell_h,
                  noise_scale, threshold, octaves, seed,
                  use_paths, path_keys, path_cell_radius, path_strength,
                  path_carve,
                  use_bounds, bounds_meshes, bounds_aabb, bounds_strict,
-                 grid_type, grid_origin):
+                 grid_type, grid_origin,
+                 influence_geos, inf_geo_radius, inf_geo_strength, inf_geo_mode,
+                 hollow, offset, offset_dir):
         """Generate voxel field.  Without paths the grid is filled solid.
         When paths are supplied they act as attractors (concentrate) or
         subtractors (carve) with Perlin noise providing organic variation.
-        Uses pre-expanded influence field keyed by grid indices for O(1)
-        detection of whether a voxel is near a path."""
+        External geometry (influence_geos) can influence voxel density based on distance:
+          - mode 0: Concentrate — attract voxels toward geometry
+          - mode 1: Carve — remove voxels near geometry
+          - mode 2: Constrain — use geometry as bounding volume (clipping)
+        Shell operations can hollow the voxel field and offset it inward/outward."""
         self.perlin = PerlinNoise(seed)
         oct_noise = self.perlin.octave_noise
         voxels = []
@@ -305,6 +418,15 @@ class VoxelSystem(object):
             _cr = float(path_cell_radius) if path_cell_radius > 0 else 1.0
         else:
             influence = None; _inf_get = None; _cr = 1.0
+
+        _has_inf_geos = bool(influence_geos) and inf_geo_radius > 0
+        if _has_inf_geos:
+            _ig_r = float(inf_geo_radius)
+            _ig_s = float(inf_geo_strength)
+            _ig_mode = int(inf_geo_mode)
+            _ig_list = list(influence_geos)
+        else:
+            _ig_r = 0.0; _ig_s = 0.0; _ig_mode = 0; _ig_list = []
 
         if use_bounds and bounds_meshes and bounds_aabb and bounds_aabb.IsValid:
             _bb_min = bounds_aabb.Min; _bb_max = bounds_aabb.Max
@@ -358,6 +480,24 @@ class VoxelSystem(object):
                     if not _carve:
                         val -= half_ps
 
+                if _has_inf_geos:
+                    voxel_pt = _Point3d(cx_b, cy_b, cz_b)
+                    min_dist = float('inf')
+                    for geo in _ig_list:
+                        dist = self._closest_dist(voxel_pt, geo)
+                        if dist < min_dist:
+                            min_dist = dist
+                    
+                    if _ig_mode == 2:
+                        if min_dist < float('inf') and min_dist > 0.01:
+                            val = 0.0
+                    elif min_dist <= _ig_r and min_dist < float('inf'):
+                        d_norm = min_dist / _ig_r
+                        if _ig_mode == 1:
+                            val -= (1.0 - d_norm) * _ig_s
+                        else:
+                            val += (1.0 - d_norm) * _ig_s
+
                 if val < 0.0:
                     val = 0.0
                 elif val > 1.0:
@@ -405,48 +545,84 @@ class VoxelSystem(object):
                     _append((fx, fy, fz, val))
         else:
             for (fx, fy, fz) in positions:
-                if _do_bounds:
-                    cx_b = ox + fx * cell_w + hw
-                    cy_b = oy + fy * cell_l + hl
-                    cz_b = oz + fz * cell_h + hh
-                    if (cx_b < bb_min_x or cx_b > bb_max_x or
-                        cy_b < bb_min_y or cy_b > bb_max_y or
-                        cz_b < bb_min_z or cz_b > bb_max_z):
-                        continue
-                    if _bounds_strict:
-                        _corners_ok = True
-                        for cdx in (0.0, cell_w):
-                            for cdy in (0.0, cell_l):
-                                for cdz in (0.0, cell_h):
-                                    cp = _Point3d(
-                                        ox + fx * cell_w + cdx,
-                                        oy + fy * cell_l + cdy,
-                                        oz + fz * cell_h + cdz)
-                                    _in = False
-                                    for bm in _bounds_meshes:
-                                        if bm.IsPointInside(
-                                                cp, 0.001, False):
-                                            _in = True
+                cx_b = ox + fx * cell_w + hw
+                cy_b = oy + fy * cell_l + hl
+                cz_b = oz + fz * cell_h + hh
+
+                val = oct_noise(fx * noise_scale, fy * noise_scale,
+                                fz * noise_scale, octaves)
+                val = (val + 1.0) * 0.5
+
+                if _has_inf_geos:
+                    voxel_pt = _Point3d(cx_b, cy_b, cz_b)
+                    min_dist = float('inf')
+                    for geo in _ig_list:
+                        dist = self._closest_dist(voxel_pt, geo)
+                        if dist < min_dist:
+                            min_dist = dist
+                    
+                    if _ig_mode == 2:
+                        if min_dist < float('inf') and min_dist > 0.01:
+                            val = 0.0
+                    elif min_dist <= _ig_r and min_dist < float('inf'):
+                        d_norm = min_dist / _ig_r
+                        if _ig_mode == 1:
+                            val -= (1.0 - d_norm) * _ig_s
+                        else:
+                            val += (1.0 - d_norm) * _ig_s
+
+                if val < 0.0:
+                    val = 0.0
+                elif val > 1.0:
+                    val = 1.0
+
+                if val > threshold:
+                    if _do_bounds:
+                        if (cx_b < bb_min_x or cx_b > bb_max_x or
+                            cy_b < bb_min_y or cy_b > bb_max_y or
+                            cz_b < bb_min_z or cz_b > bb_max_z):
+                            continue
+                        if _bounds_strict:
+                            _corners_ok = True
+                            for cdx in (0.0, cell_w):
+                                for cdy in (0.0, cell_l):
+                                    for cdz in (0.0, cell_h):
+                                        cp = _Point3d(
+                                            ox + fx * cell_w + cdx,
+                                            oy + fy * cell_l + cdy,
+                                            oz + fz * cell_h + cdz)
+                                        _in = False
+                                        for bm in _bounds_meshes:
+                                            if bm.IsPointInside(
+                                                    cp, 0.001, False):
+                                                _in = True
+                                                break
+                                        if not _in:
+                                            _corners_ok = False
                                             break
-                                    if not _in:
-                                        _corners_ok = False
+                                    if not _corners_ok:
                                         break
                                 if not _corners_ok:
                                     break
                             if not _corners_ok:
-                                break
-                        if not _corners_ok:
-                            continue
-                    else:
-                        pt = _Point3d(cx_b, cy_b, cz_b)
-                        _in = False
-                        for bm in _bounds_meshes:
-                            if bm.IsPointInside(pt, 0.001, False):
-                                _in = True
-                                break
-                        if not _in:
-                            continue
-                _append((fx, fy, fz, 1.0))
+                                continue
+                        else:
+                            pt = _Point3d(cx_b, cy_b, cz_b)
+                            _in = False
+                            for bm in _bounds_meshes:
+                                if bm.IsPointInside(pt, 0.001, False):
+                                    _in = True
+                                    break
+                            if not _in:
+                                continue
+                    _append((fx, fy, fz, val))
+
+        if hollow:
+            voxels = self._hollow_voxels(voxels)
+        
+        if hollow and offset != 0:
+            offset_outward = (offset_dir == 0)
+            voxels = self._offset_shell(voxels, offset, offset_outward)
 
         self.voxels = voxels
         return voxels
@@ -1514,6 +1690,224 @@ class VoxelPathfinder(object):
 
 
 # ---------------------------------------------------------------------------
+# Boid Growth System
+# Agents move through 3D space using flocking rules (separation, alignment,
+# cohesion). As they move they deposit density on nearby voxel cells, creating
+# smooth organic growth. Supports point/curve/mesh attractors.
+# ---------------------------------------------------------------------------
+class BoidGrowthSystem(object):
+    def __init__(self):
+        self.agents = []
+        self.density = {}
+        self.trails = []
+        self.attractor_geos = []
+        self.step_count = 0
+        self._rng = random.Random(0)
+
+    def spawn(self, count, grid_x, grid_y, grid_z, cell_w, cell_l, cell_h,
+              grid_origin, seed):
+        """Create agents at random positions within the grid."""
+        self._rng = random.Random(seed)
+        self.agents = []
+        self.trails = []
+        self.density = {}
+        self.step_count = 0
+        ox = grid_origin.X; oy = grid_origin.Y; oz = grid_origin.Z
+        for _ in range(count):
+            fx = self._rng.random() * grid_x
+            fy = self._rng.random() * grid_y
+            fz = self._rng.random() * grid_z
+            wx = ox + fx * cell_w + cell_w * 0.5
+            wy = oy + fy * cell_l + cell_l * 0.5
+            wz = oz + fz * cell_h + cell_h * 0.5
+            vx = (self._rng.random() - 0.5) * 2.0
+            vy = (self._rng.random() - 0.5) * 2.0
+            vz = (self._rng.random() - 0.5) * 2.0
+            self.agents.append({'pos': [wx, wy, wz], 'vel': [vx, vy, vz]})
+            self.trails.append([rg.Point3d(wx, wy, wz)])
+
+    def tick(self, max_speed, sep_radius, sep_weight,
+             align_radius, align_weight,
+             coh_radius, coh_weight,
+             attractor_strength,
+             growth_radius, growth_strength,
+             cell_w, cell_l, cell_h,
+             grid_x, grid_y, grid_z,
+             grid_origin, boundary_mode):
+        """Advance one simulation step."""
+        if not self.agents:
+            return
+        n = len(self.agents)
+        ox = grid_origin.X; oy = grid_origin.Y; oz = grid_origin.Z
+        max_x = ox + grid_x * cell_w
+        max_y = oy + grid_y * cell_l
+        max_z = oz + grid_z * cell_h
+        _sqrt = math.sqrt
+
+        positions = [a['pos'] for a in self.agents]
+        velocities = [a['vel'] for a in self.agents]
+
+        new_vels = []
+        for i in range(n):
+            px, py, pz = positions[i]
+            vx, vy, vz = velocities[i]
+            fx = fy = fz = 0.0
+            s_x = s_y = s_z = 0.0
+            a_x = a_y = a_z = 0.0
+            a_cnt = 0
+            c_x = c_y = c_z = 0.0
+            c_cnt = 0
+
+            for j in range(n):
+                if i == j:
+                    continue
+                jx, jy, jz = positions[j]
+                dx = jx - px; dy = jy - py; dz = jz - pz
+                d = _sqrt(dx * dx + dy * dy + dz * dz)
+                if d < 1e-10:
+                    continue
+                if d < sep_radius:
+                    f = 1.0 - d / sep_radius
+                    inv = f / d
+                    s_x -= dx * inv
+                    s_y -= dy * inv
+                    s_z -= dz * inv
+                if d < align_radius:
+                    jvx, jvy, jvz = velocities[j]
+                    a_x += jvx; a_y += jvy; a_z += jvz
+                    a_cnt += 1
+                if d < coh_radius:
+                    c_x += jx; c_y += jy; c_z += jz
+                    c_cnt += 1
+
+            fx += s_x * sep_weight
+            fy += s_y * sep_weight
+            fz += s_z * sep_weight
+
+            if a_cnt > 0:
+                a_x /= a_cnt; a_y /= a_cnt; a_z /= a_cnt
+                fx += (a_x - vx) * align_weight
+                fy += (a_y - vy) * align_weight
+                fz += (a_z - vz) * align_weight
+
+            if c_cnt > 0:
+                c_x /= c_cnt; c_y /= c_cnt; c_z /= c_cnt
+                fx += (c_x - px) * coh_weight * 0.01
+                fy += (c_y - py) * coh_weight * 0.01
+                fz += (c_z - pz) * coh_weight * 0.01
+
+            if self.attractor_geos and attractor_strength > 0:
+                pt = rg.Point3d(px, py, pz)
+                best_d = float('inf')
+                best_cp = None
+                for geo in self.attractor_geos:
+                    cp = _closest_point_on_geo(geo, pt)
+                    if cp:
+                        d = pt.DistanceTo(cp)
+                        if d < best_d:
+                            best_d = d
+                            best_cp = cp
+                if best_cp and best_d > 1e-10:
+                    adx = best_cp.X - px
+                    ady = best_cp.Y - py
+                    adz = best_cp.Z - pz
+                    inv_d = attractor_strength / best_d
+                    fx += adx * inv_d
+                    fy += ady * inv_d
+                    fz += adz * inv_d
+
+            vx += fx; vy += fy; vz += fz
+            speed = _sqrt(vx * vx + vy * vy + vz * vz)
+            if speed > max_speed:
+                s = max_speed / speed
+                vx *= s; vy *= s; vz *= s
+            new_vels.append([vx, vy, vz])
+
+        _density = self.density
+        _get = _density.get
+        R = growth_radius
+        R_sq = R * R
+        R_f = float(R) if R > 0 else 1.0
+
+        for i in range(n):
+            nvx, nvy, nvz = new_vels[i]
+            px, py, pz = positions[i]
+            px += nvx; py += nvy; pz += nvz
+
+            if boundary_mode == 0:
+                if px < ox: px += (max_x - ox)
+                elif px > max_x: px -= (max_x - ox)
+                if py < oy: py += (max_y - oy)
+                elif py > max_y: py -= (max_y - oy)
+                if pz < oz: pz += (max_z - oz)
+                elif pz > max_z: pz -= (max_z - oz)
+            else:
+                if px < ox:
+                    px = ox; nvx = abs(nvx)
+                elif px > max_x:
+                    px = max_x; nvx = -abs(nvx)
+                if py < oy:
+                    py = oy; nvy = abs(nvy)
+                elif py > max_y:
+                    py = max_y; nvy = -abs(nvy)
+                if pz < oz:
+                    pz = oz; nvz = abs(nvz)
+                elif pz > max_z:
+                    pz = max_z; nvz = -abs(nvz)
+
+            self.agents[i]['pos'] = [px, py, pz]
+            self.agents[i]['vel'] = [nvx, nvy, nvz]
+            self.trails[i].append(rg.Point3d(px, py, pz))
+
+            gx_f = (px - ox) / cell_w
+            gy_f = (py - oy) / cell_l
+            gz_f = (pz - oz) / cell_h
+            igx = int(gx_f) if gx_f >= 0 else int(gx_f) - 1
+            igy = int(gy_f) if gy_f >= 0 else int(gy_f) - 1
+            igz = int(gz_f) if gz_f >= 0 else int(gz_f) - 1
+
+            for dx in range(-R, R + 1):
+                dx_sq = dx * dx
+                if dx_sq > R_sq:
+                    continue
+                for dy in range(-R, R + 1):
+                    dxy_sq = dx_sq + dy * dy
+                    if dxy_sq > R_sq:
+                        continue
+                    for dz in range(-R, R + 1):
+                        dsq = dxy_sq + dz * dz
+                        if dsq > R_sq:
+                            continue
+                        nx = igx + dx; ny = igy + dy; nz = igz + dz
+                        if 0 <= nx < grid_x and 0 <= ny < grid_y and 0 <= nz < grid_z:
+                            falloff = 1.0 - _sqrt(dsq) / R_f
+                            k = (nx, ny, nz)
+                            _density[k] = _get(k, 0.0) + growth_strength * falloff
+
+        self.step_count += 1
+
+    def get_voxels(self, threshold, grid_x, grid_y, grid_z):
+        """Convert density field to voxel list."""
+        voxels = []
+        _append = voxels.append
+        for (ix, iy, iz), val in self.density.items():
+            if val > threshold and 0 <= ix < grid_x and 0 <= iy < grid_y and 0 <= iz < grid_z:
+                clamped = val if val <= 1.0 else 1.0
+                _append((ix, iy, iz, clamped))
+        return voxels
+
+    def get_agent_points(self):
+        return [rg.Point3d(a['pos'][0], a['pos'][1], a['pos'][2])
+                for a in self.agents]
+
+    def reset(self):
+        self.agents = []
+        self.density = {}
+        self.trails = []
+        self.step_count = 0
+
+
+# ---------------------------------------------------------------------------
 # UI Dialog
 # Eto.Forms window with all sliders, checkboxes and buttons. Uses a debounced
 # timer (UITimer at 0.12s) so slider drags don't trigger a full recompute on
@@ -1533,12 +1927,15 @@ class VoxelDialog(forms.Form):
         self.bounds_geometries = []
         self.bounds_meshes = []
         self.bounds_aabb = None
+        self.influence_geos = []
         self.voxel_color = System.Drawing.Color.FromArgb(100, 180, 255)
         self.system.conduit.shaded_material = rd.DisplayMaterial(
             System.Drawing.Color.FromArgb(100, 180, 255))
         self.edge_color = System.Drawing.Color.FromArgb(40, 40, 40)
         self.bounds_color = System.Drawing.Color.FromArgb(80, 80, 80)
         self.pathfinder = VoxelPathfinder()
+        self.boid_growth = BoidGrowthSystem()
+        self._boid_playing = False
 
         self._compute_dirty = False
         self._display_dirty = False
@@ -1569,6 +1966,10 @@ class VoxelDialog(forms.Form):
         self._anim_slime_timer = forms.UITimer()
         self._anim_slime_timer.Interval = 0.05
         self._anim_slime_timer.Elapsed += self._on_anim_slime_tick
+
+        self._boid_timer = forms.UITimer()
+        self._boid_timer.Interval = 0.04
+        self._boid_timer.Elapsed += self._on_boid_tick
 
         self._full_regenerate()
 
@@ -2128,6 +2529,39 @@ class VoxelDialog(forms.Form):
             inner, "Path Strength", 0.0, 3.0, 1.0, self._mark_compute)
 
         inner.AddRow(None)
+        inner.AddRow(self._bold("External Geometry Influence"))
+
+        btn_pick_inf_geo = forms.Button()
+        btn_pick_inf_geo.Text = "Assign Geometry"
+        btn_pick_inf_geo.Click += self._on_pick_influence_geo
+        btn_clr_inf_geo = forms.Button()
+        btn_clr_inf_geo.Text = "Clear Geometry"
+        btn_clr_inf_geo.Width = 100
+        btn_clr_inf_geo.Click += self._on_clear_influence_geo
+        inner.AddRow(btn_pick_inf_geo, btn_clr_inf_geo)
+
+        self.lbl_inf_geo = forms.Label()
+        self.lbl_inf_geo.Text = "Geometry: None"
+        inner.AddRow(self.lbl_inf_geo)
+
+        self.sld_inf_geo_r, self.txt_inf_geo_r = self._int_slider(
+            inner, "Geometry Influence Radius", 0, 30, 3, self._mark_compute)
+        self.sld_inf_geo_s, self.txt_inf_geo_s = self._float_slider(
+            inner, "Geometry Strength", 0.0, 3.0, 1.0, self._mark_compute)
+
+        lbl_inf_mode = forms.Label()
+        lbl_inf_mode.Text = "Influence Mode"
+        lbl_inf_mode.Width = 105
+        self.dd_inf_geo_mode = forms.DropDown()
+        self.dd_inf_geo_mode.Width = 150
+        self.dd_inf_geo_mode.Items.Add("Concentrate")
+        self.dd_inf_geo_mode.Items.Add("Carve")
+        self.dd_inf_geo_mode.Items.Add("Constrain")
+        self.dd_inf_geo_mode.SelectedIndex = 0
+        self.dd_inf_geo_mode.SelectedIndexChanged += lambda s, e: self._mark_compute()
+        inner.AddRow(lbl_inf_mode, self.dd_inf_geo_mode)
+
+        inner.AddRow(None)
 
         self.chk_show_influence = forms.CheckBox()
         self.chk_show_influence.Text = "Show Influence Paths"
@@ -2160,6 +2594,130 @@ class VoxelDialog(forms.Form):
             inner, "Octaves", 1, 6, 3, self._mark_compute)
         self.sld_seed, self.txt_seed = self._int_slider(
             inner, "Seed", 0, 100, 0, self._mark_compute)
+
+        _sec_finish()
+
+        # -- boid growth ---------------------------------------------------
+        inner, _sec_finish = self._section(layout, "Boid Growth", False)
+
+        inner.AddRow(self._bold("Agents"))
+
+        self.sld_boid_count, self.txt_boid_count = self._int_slider(
+            inner, "Agent Count", 1, 100, 15, self._mark_boid_param)
+        self.sld_boid_speed, self.txt_boid_speed = self._float_slider(
+            inner, "Max Speed", 0.1, 100.0, 8.0, self._mark_boid_param)
+        self.sld_boid_seed, self.txt_boid_seed = self._int_slider(
+            inner, "Seed", 0, 100, 42, self._mark_boid_param)
+
+        inner.AddRow(None)
+        inner.AddRow(self._bold("Flocking Rules"))
+
+        self.sld_sep_w, self.txt_sep_w = self._float_slider(
+            inner, "Sep Weight", 0.0, 5.0, 1.5, self._mark_boid_param)
+        self.sld_sep_r, self.txt_sep_r = self._float_slider(
+            inner, "Sep Radius", 0.1, 200.0, 15.0, self._mark_boid_param)
+        self.sld_ali_w, self.txt_ali_w = self._float_slider(
+            inner, "Align Weight", 0.0, 5.0, 1.0, self._mark_boid_param)
+        self.sld_ali_r, self.txt_ali_r = self._float_slider(
+            inner, "Align Radius", 0.1, 200.0, 25.0, self._mark_boid_param)
+        self.sld_coh_w, self.txt_coh_w = self._float_slider(
+            inner, "Cohesion Weight", 0.0, 5.0, 1.0, self._mark_boid_param)
+        self.sld_coh_r, self.txt_coh_r = self._float_slider(
+            inner, "Cohesion Radius", 0.1, 200.0, 30.0, self._mark_boid_param)
+
+        inner.AddRow(None)
+        inner.AddRow(self._bold("Growth"))
+
+        self.sld_grow_r, self.txt_grow_r = self._int_slider(
+            inner, "Growth Radius", 0, 10, 2, self._mark_boid_param)
+        self.sld_grow_s, self.txt_grow_s = self._float_slider(
+            inner, "Growth Strength", 0.001, 0.5, 0.05, self._mark_boid_param)
+        self.sld_grow_t, self.txt_grow_t = self._float_slider(
+            inner, "Growth Threshold", 0.0, 1.0, 0.15, self._mark_boid_param)
+
+        lbl_bnd = forms.Label()
+        lbl_bnd.Text = "Boundary"
+        lbl_bnd.Width = 105
+        self.dd_boid_boundary = forms.DropDown()
+        self.dd_boid_boundary.Width = 150
+        self.dd_boid_boundary.Items.Add("Wrap")
+        self.dd_boid_boundary.Items.Add("Bounce")
+        self.dd_boid_boundary.SelectedIndex = 1
+        inner.AddRow(lbl_bnd, self.dd_boid_boundary)
+
+        inner.AddRow(None)
+        inner.AddRow(self._bold("Attractors"))
+
+        btn_boid_pick = forms.Button()
+        btn_boid_pick.Text = "Pick Attractors"
+        btn_boid_pick.Click += self._on_boid_pick_attractor
+        btn_boid_clr = forms.Button()
+        btn_boid_clr.Text = "Clear"
+        btn_boid_clr.Click += self._on_boid_clear_attractor
+        inner.AddRow(btn_boid_pick, btn_boid_clr)
+
+        self.lbl_boid_attr = forms.Label()
+        self.lbl_boid_attr.Text = "Attractors: 0"
+        inner.AddRow(self.lbl_boid_attr)
+
+        self.sld_attr_s, self.txt_attr_s = self._float_slider(
+            inner, "Attractor Strength", 0.0, 10.0, 2.0, self._mark_boid_param)
+
+        inner.AddRow(None)
+        inner.AddRow(self._bold("Controls"))
+
+        self.btn_boid_play = forms.Button()
+        self.btn_boid_play.Text = u"\u25B6 Play"
+        self.btn_boid_play.Click += self._on_boid_play
+
+        self.btn_boid_pause = forms.Button()
+        self.btn_boid_pause.Text = u"\u23F8 Pause"
+        self.btn_boid_pause.Enabled = False
+        self.btn_boid_pause.Click += self._on_boid_pause
+
+        self.btn_boid_reset = forms.Button()
+        self.btn_boid_reset.Text = u"\u21BA Reset"
+        self.btn_boid_reset.Click += self._on_boid_reset
+
+        self.btn_boid_apply = forms.Button()
+        self.btn_boid_apply.Text = "Apply"
+        self.btn_boid_apply.Click += self._on_boid_apply
+        inner.AddRow(self.btn_boid_play, self.btn_boid_pause,
+                     self.btn_boid_reset, self.btn_boid_apply)
+
+        self.lbl_boid_step = forms.Label()
+        self.lbl_boid_step.Text = "Step: 0  |  Voxels: 0"
+        inner.AddRow(self.lbl_boid_step)
+
+        inner.AddRow(None)
+        inner.AddRow(self._bold("Display"))
+
+        self.chk_show_boid_agents = forms.CheckBox()
+        self.chk_show_boid_agents.Text = "Show Agents"
+        self.chk_show_boid_agents.Checked = True
+        self.chk_show_boid_agents.CheckedChanged += lambda s, e: self._update_boid_display()
+
+        self.chk_show_boid_trails = forms.CheckBox()
+        self.chk_show_boid_trails.Text = "Show Trails"
+        self.chk_show_boid_trails.Checked = True
+        self.chk_show_boid_trails.CheckedChanged += lambda s, e: self._update_boid_display()
+        inner.AddRow(self.chk_show_boid_agents, self.chk_show_boid_trails)
+
+        self.sld_boid_thick, self.txt_boid_thick = self._int_slider(
+            inner, "Trail Thickness", 1, 10, 2, self._update_boid_display)
+
+        self.btn_boid_agent_col = forms.Button()
+        self.btn_boid_agent_col.Text = "Agent Colour"
+        self.btn_boid_agent_col.Width = 120
+        self.btn_boid_agent_col.BackgroundColor = drawing.Color.FromArgb(255, 80, 200)
+        self.btn_boid_agent_col.Click += self._on_boid_pick_agent_color
+
+        self.btn_boid_trail_col = forms.Button()
+        self.btn_boid_trail_col.Text = "Trail Colour"
+        self.btn_boid_trail_col.Width = 120
+        self.btn_boid_trail_col.BackgroundColor = drawing.Color.FromArgb(200, 100, 255)
+        self.btn_boid_trail_col.Click += self._on_boid_pick_trail_color
+        inner.AddRow(self.btn_boid_agent_col, self.btn_boid_trail_col)
 
         _sec_finish()
 
@@ -2223,6 +2781,35 @@ class VoxelDialog(forms.Form):
         lbl_grad_desc = forms.Label()
         lbl_grad_desc.Text = "Colour = noise density (threshold \u2192 max)"
         inner.AddRow(lbl_grad_desc)
+
+        _sec_finish()
+
+        # -- shell operations -----------------------------------------------
+        inner, _sec_finish = self._section(layout, "Shell Operations", False)
+
+        self.chk_hollow = forms.CheckBox()
+        self.chk_hollow.Text = "Hollow Out (one voxel thick)"
+        self.chk_hollow.Checked = False
+        self.chk_hollow.CheckedChanged += lambda s, e: self._mark_compute()
+        inner.AddRow(self.chk_hollow)
+
+        self.sld_offset, self.txt_offset = self._int_slider(
+            inner, "Shell Offset (voxels)", -10, 10, 0, self._mark_compute)
+
+        lbl_offset_dir = forms.Label()
+        lbl_offset_dir.Text = "Offset Direction"
+        lbl_offset_dir.Width = 105
+        self.dd_offset_dir = forms.DropDown()
+        self.dd_offset_dir.Width = 150
+        self.dd_offset_dir.Items.Add("Outward")
+        self.dd_offset_dir.Items.Add("Inward")
+        self.dd_offset_dir.SelectedIndex = 0
+        self.dd_offset_dir.SelectedIndexChanged += lambda s, e: self._mark_compute()
+        inner.AddRow(lbl_offset_dir, self.dd_offset_dir)
+
+        lbl_offset_desc = forms.Label()
+        lbl_offset_desc.Text = "Note: Offset applies to hollowed voxels only"
+        inner.AddRow(lbl_offset_desc)
 
         _sec_finish()
 
@@ -2449,7 +3036,9 @@ class VoxelDialog(forms.Form):
         """Collect all UI parameter values into a single tuple.
         Layout:  0-2  gx,gy,gz   3-5  cw,cl,ch   6-9  scale,thresh,octaves,seed
                 10-13 use_paths,path_r,path_s,path_carve
-                14-15 use_bounds,bounds_strict   16 grid_type"""
+                14-15 use_bounds,bounds_strict   16 grid_type
+                17-20 inf_geo_list,inf_geo_r,inf_geo_s,inf_geo_mode
+                21-23 hollow,offset,offset_dir"""
         gx = self._ival(self.txt_gx, self.sld_gx)
         gy = self._ival(self.txt_gy, self.sld_gy)
         gz = self._ival(self.txt_gz, self.sld_gz)
@@ -2467,9 +3056,17 @@ class VoxelDialog(forms.Form):
         use_bounds = self.chk_use_bounds.Checked == True
         bounds_strict = self.dd_clip_mode.SelectedIndex == 1
         grid_type = self.dd_grid_type.SelectedIndex
+        inf_geo_r = self._ival(self.txt_inf_geo_r, self.sld_inf_geo_r)
+        inf_geo_s = self._fval(self.txt_inf_geo_s, self.sld_inf_geo_s, 0.0, 3.0)
+        inf_geo_mode = self.dd_inf_geo_mode.SelectedIndex
+        hollow = self.chk_hollow.Checked == True
+        offset = self._ival(self.txt_offset, self.sld_offset)
+        offset_dir = self.dd_offset_dir.SelectedIndex
         return (gx, gy, gz, cw, cl, ch, scale, thresh, octaves, seed,
                 use_paths, path_r, path_s, path_carve,
-                use_bounds, bounds_strict, grid_type)
+                use_bounds, bounds_strict, grid_type,
+                self.influence_geos, inf_geo_r, inf_geo_s, inf_geo_mode,
+                hollow, offset, offset_dir)
 
     # -- compute grid origin -----------------------------------------------
     def _grid_origin(self, gx, gy, gz, cw, cl, ch):
@@ -2496,6 +3093,8 @@ class VoxelDialog(forms.Form):
         use_paths, path_r, path_s, path_carve = p[10], p[11], p[12], p[13]
         use_bounds, bounds_strict = p[14], p[15]
         grid_type = p[16]
+        influence_geos, inf_geo_r, inf_geo_s, inf_geo_mode = p[17], p[18], p[19], p[20]
+        hollow, offset, offset_dir = p[21], p[22], p[23]
 
         path_keys = set()
         all_trails = (self.system.conduit.wander_trails +
@@ -2533,13 +3132,24 @@ class VoxelDialog(forms.Form):
             self.lbl_wander_status.Text = "Wander: 0"
         if hasattr(self, 'lbl_slime_status'):
             self.lbl_slime_status.Text = "Slime: 0"
+        if self._boid_playing:
+            self._boid_playing = False
+            self._boid_timer.Stop()
+            self.btn_boid_play.Enabled = True
+            self.btn_boid_pause.Enabled = False
+        self.system.conduit.boid_points = []
+        self.system.conduit.boid_trails = []
+        self.boid_growth.reset()
+        self.lbl_boid_step.Text = "Step: 0  |  Voxels: 0"
         self.lbl_status.Text = "Computing {} cells...".format(total)
 
         voxels = self.system.generate(
             gx, gy, gz, cw, cl, ch, scale, thresh, octaves, seed,
             use_paths, path_keys, path_r, path_s, path_carve,
             use_bounds, self.bounds_meshes, self.bounds_aabb, bounds_strict,
-            grid_type, origin)
+            grid_type, origin,
+            influence_geos, inf_geo_r, inf_geo_s, inf_geo_mode,
+            hollow, offset, offset_dir)
 
         show_bounds = self.chk_bounds.Checked == True
         show_edges = self.chk_edges.Checked == True
@@ -2665,10 +3275,18 @@ class VoxelDialog(forms.Form):
         self.system.conduit.wander_trails = []
         self.system.conduit.slime_trails = []
         self.system.conduit.path_points = []
+        self.system.conduit.boid_points = []
+        self.system.conduit.boid_trails = []
         self.system.voxels = []
         self.pathfinder.trails = []
         self.pathfinder.trail_keys = []
         self.pathfinder.graph = {}
+        self._boid_playing = False
+        self._boid_timer.Stop()
+        self.boid_growth.reset()
+        self.btn_boid_play.Enabled = True
+        self.btn_boid_pause.Enabled = False
+        self.lbl_boid_step.Text = "Step: 0  |  Voxels: 0"
         sc.doc.Views.Redraw()
         self.lbl_status.Text = "Cleared"
         if hasattr(self, 'lbl_wander_status'):
@@ -2681,6 +3299,7 @@ class VoxelDialog(forms.Form):
         self._timer.Stop()
         self._anim_wander_timer.Stop()
         self._anim_slime_timer.Stop()
+        self._boid_timer.Stop()
         self.system.dispose()
 
     # -- bounding geometry -------------------------------------------------
@@ -3481,6 +4100,209 @@ class VoxelDialog(forms.Form):
     def _on_clear_influence(self, sender, e):
         self.system.conduit.influence_trails = []
         sc.doc.Views.Redraw()
+
+    def _on_pick_influence_geo(self, sender, e):
+        """Pick external geometry (curves, breps, meshes, surfaces) as influence."""
+        self.Visible = False
+        go = Rhino.Input.Custom.GetObject()
+        go.SetCommandPrompt("Select influence geometry (curves, breps, meshes, surfaces)")
+        go.GeometryFilter = (
+            Rhino.DocObjects.ObjectType.Curve |
+            Rhino.DocObjects.ObjectType.Mesh |
+            Rhino.DocObjects.ObjectType.Brep |
+            Rhino.DocObjects.ObjectType.Surface |
+            Rhino.DocObjects.ObjectType.Extrusion)
+        go.EnablePreSelect(False, True)
+        go.GetMultiple(1, 0)
+        if go.CommandResult() == Rhino.Commands.Result.Success:
+            geos = []
+            for i in range(go.ObjectCount):
+                geo = go.Object(i).Geometry()
+                if geo:
+                    dup = geo.Duplicate()
+                    if isinstance(dup, rg.Extrusion):
+                        brep = dup.ToBrep()
+                        if brep:
+                            dup = brep
+                    geos.append(dup)
+            self.influence_geos = geos
+            self.lbl_inf_geo.Text = "Geometry: {}".format(len(geos))
+            self._mark_compute()
+        self.Visible = True
+
+    def _on_clear_influence_geo(self, sender, e):
+        """Clear assigned influence geometry."""
+        self.influence_geos = []
+        self.lbl_inf_geo.Text = "Geometry: None"
+        self._mark_compute()
+
+    # -- boid growth -------------------------------------------------------
+    def _mark_boid_param(self):
+        """Parameter changed — no live effect during playback, just stored."""
+        pass
+
+    def _on_boid_play(self, sender, e):
+        """Start or resume boid growth simulation."""
+        p = self._read_params()
+        gx, gy, gz = p[0], p[1], p[2]
+        cw, cl, ch = p[3], p[4], p[5]
+        origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
+
+        if self.boid_growth.step_count == 0:
+            count = self._ival(self.txt_boid_count, self.sld_boid_count)
+            boid_seed = self._ival(self.txt_boid_seed, self.sld_boid_seed)
+            self.boid_growth.spawn(count, gx, gy, gz, cw, cl, ch,
+                                   origin, boid_seed)
+
+        self._boid_playing = True
+        self.btn_boid_play.Enabled = False
+        self.btn_boid_pause.Enabled = True
+        self._boid_timer.Start()
+
+    def _on_boid_pause(self, sender, e):
+        self._boid_playing = False
+        self._boid_timer.Stop()
+        self.btn_boid_play.Enabled = True
+        self.btn_boid_pause.Enabled = False
+
+    def _on_boid_reset(self, sender, e):
+        self._boid_playing = False
+        self._boid_timer.Stop()
+        self.boid_growth.reset()
+        self.system.conduit.boid_points = []
+        self.system.conduit.boid_trails = []
+        self.btn_boid_play.Enabled = True
+        self.btn_boid_pause.Enabled = False
+        self.lbl_boid_step.Text = "Step: 0  |  Voxels: 0"
+        self._full_regenerate()
+
+    def _on_boid_apply(self, sender, e):
+        """Apply boid-grown voxels to the main system."""
+        p = self._read_params()
+        gx, gy, gz = p[0], p[1], p[2]
+        grow_t = self._fval(self.txt_grow_t, self.sld_grow_t, 0.0, 1.0)
+        voxels = self.boid_growth.get_voxels(grow_t, gx, gy, gz)
+        if not voxels:
+            self.lbl_status.Text = "No voxels to apply"
+            return
+        self.system.voxels = voxels
+        self._display_only()
+        self.lbl_status.Text = "Applied {} boid voxels".format(len(voxels))
+
+    def _on_boid_tick(self, sender, e):
+        """One simulation step per timer tick."""
+        if not self._boid_playing:
+            return
+
+        p = self._read_params()
+        gx, gy, gz = p[0], p[1], p[2]
+        cw, cl, ch = p[3], p[4], p[5]
+        grid_type = p[16]
+        origin = self._grid_origin(gx, gy, gz, cw, cl, ch)
+
+        max_speed = self._fval(self.txt_boid_speed, self.sld_boid_speed, 0.1, 100.0)
+        sep_w = self._fval(self.txt_sep_w, self.sld_sep_w, 0.0, 5.0)
+        sep_r = self._fval(self.txt_sep_r, self.sld_sep_r, 0.1, 200.0)
+        ali_w = self._fval(self.txt_ali_w, self.sld_ali_w, 0.0, 5.0)
+        ali_r = self._fval(self.txt_ali_r, self.sld_ali_r, 0.1, 200.0)
+        coh_w = self._fval(self.txt_coh_w, self.sld_coh_w, 0.0, 5.0)
+        coh_r = self._fval(self.txt_coh_r, self.sld_coh_r, 0.1, 200.0)
+        attr_s = self._fval(self.txt_attr_s, self.sld_attr_s, 0.0, 10.0)
+        grow_r = self._ival(self.txt_grow_r, self.sld_grow_r)
+        grow_s = self._fval(self.txt_grow_s, self.sld_grow_s, 0.001, 0.5)
+        grow_t = self._fval(self.txt_grow_t, self.sld_grow_t, 0.0, 1.0)
+        boundary = self.dd_boid_boundary.SelectedIndex
+
+        self.boid_growth.tick(
+            max_speed, sep_r, sep_w, ali_r, ali_w, coh_r, coh_w,
+            attr_s, grow_r, grow_s, cw, cl, ch,
+            gx, gy, gz, origin, boundary)
+
+        voxels = self.boid_growth.get_voxels(grow_t, gx, gy, gz)
+        self.system.voxels = voxels
+
+        show_bounds = self.chk_bounds.Checked == True
+        show_edges = self.chk_edges.Checked == True
+        use_custom = self.chk_use_custom.Checked == True
+        custom_scale = self._fval(self.txt_custom_s, self.sld_custom_s, 0.1, 2.0)
+        self.system.update_display(
+            voxels, cw, cl, ch, self.voxel_color,
+            show_bounds, self.bounds_color,
+            show_edges, self.edge_color,
+            gx, gy, gz, origin,
+            grid_type, use_custom, custom_scale)
+
+        cond = self.system.conduit
+        cond.boid_points = self.boid_growth.get_agent_points()
+        cond.boid_trails = [list(t) for t in self.boid_growth.trails]
+        cond.show_boids = self.chk_show_boid_agents.Checked == True
+        cond.show_boid_trails = self.chk_show_boid_trails.Checked == True
+        cond.boid_trail_thickness = self._ival(
+            self.txt_boid_thick, self.sld_boid_thick)
+
+        self.lbl_boid_step.Text = "Step: {}  |  Voxels: {}".format(
+            self.boid_growth.step_count, len(voxels))
+
+    def _on_boid_pick_attractor(self, sender, e):
+        self.Visible = False
+        go = Rhino.Input.Custom.GetObject()
+        go.SetCommandPrompt("Select attractor geometry (curves, meshes, breps)")
+        go.GeometryFilter = (
+            Rhino.DocObjects.ObjectType.Curve |
+            Rhino.DocObjects.ObjectType.Mesh |
+            Rhino.DocObjects.ObjectType.Brep |
+            Rhino.DocObjects.ObjectType.Surface |
+            Rhino.DocObjects.ObjectType.Extrusion)
+        go.EnablePreSelect(False, True)
+        go.GetMultiple(1, 0)
+        if go.CommandResult() == Rhino.Commands.Result.Success:
+            geos = []
+            for i in range(go.ObjectCount):
+                geo = go.Object(i).Geometry()
+                if geo:
+                    dup = geo.Duplicate()
+                    if isinstance(dup, rg.Extrusion):
+                        brep = dup.ToBrep()
+                        if brep:
+                            dup = brep
+                    geos.append(dup)
+            self.boid_growth.attractor_geos = geos
+            self.lbl_boid_attr.Text = "Attractors: {}".format(len(geos))
+        self.Visible = True
+
+    def _on_boid_clear_attractor(self, sender, e):
+        self.boid_growth.attractor_geos = []
+        self.lbl_boid_attr.Text = "Attractors: 0"
+
+    def _update_boid_display(self):
+        cond = self.system.conduit
+        cond.show_boids = self.chk_show_boid_agents.Checked == True
+        cond.show_boid_trails = self.chk_show_boid_trails.Checked == True
+        cond.boid_trail_thickness = self._ival(
+            self.txt_boid_thick, self.sld_boid_thick)
+        sc.doc.Views.Redraw()
+
+    def _on_boid_pick_agent_color(self, sender, e):
+        cd = forms.ColorDialog()
+        bc = self.system.conduit.boid_color
+        cd.Color = drawing.Color.FromArgb(bc.R, bc.G, bc.B)
+        if cd.ShowDialog(self) == forms.DialogResult.Ok:
+            c = cd.Color
+            self.system.conduit.boid_color = System.Drawing.Color.FromArgb(
+                c.Rb, c.Gb, c.Bb)
+            self.btn_boid_agent_col.BackgroundColor = c
+            sc.doc.Views.Redraw()
+
+    def _on_boid_pick_trail_color(self, sender, e):
+        cd = forms.ColorDialog()
+        bc = self.system.conduit.boid_trail_color
+        cd.Color = drawing.Color.FromArgb(bc.R, bc.G, bc.B)
+        if cd.ShowDialog(self) == forms.DialogResult.Ok:
+            c = cd.Color
+            self.system.conduit.boid_trail_color = System.Drawing.Color.FromArgb(
+                c.Rb, c.Gb, c.Bb)
+            self.btn_boid_trail_col.BackgroundColor = c
+            sc.doc.Views.Redraw()
 
 
 # ---------------------------------------------------------------------------
